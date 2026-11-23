@@ -771,8 +771,10 @@ class TestReverseSplit(unittest.TestCase):
         self.assertIsNone(S.split_adjusted_prev(0.097, 3.50, sp, "2026-11-30"))      # old split: not today's move
         self.assertIsNone(S.split_adjusted_prev(0.20, 0.30, sp, "2026-11-18"))       # real +50%, price never jumped ×35
         self.assertIsNone(S.split_adjusted_prev(0.20, 0.45, [], "2026-11-18", 0.20))  # real run, Nasdaq agrees
-        fb = S.split_adjusted_prev(0.10, 2.10, [], "2026-11-18", 2.00)               # no split data: Nasdaq fallback
+        fb = S.split_adjusted_prev(0.10, 2.10, [], "2026-11-18", 2.00, 2.05)         # no split data: Nasdaq fallback
         self.assertEqual(fb[0], 2.00)
+        # WETO 23 Nov 2026, real data: real +213% run, but Nasdaq's screener row was a day stale
+        self.assertIsNone(S.split_adjusted_prev(0.1722, 0.5385, [], "2026-11-23", 0.4998, 0.1584))
         fwd = S.split_adjusted_prev(10.0, 5.1, [{"d": "2026-11-18", "ratio": "2:1", "factor": 0.5}], "2026-11-18")
         self.assertAlmostEqual(fwd[0], 5.0)                                          # forward split isn't a crash
 

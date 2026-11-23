@@ -491,12 +491,14 @@ def fetch_daily_stats(http: Http, sym: str) -> dict | None:
 
 
 def split_adjusted_prev(prev: float, last: float, splits: list[dict], today: str,
-                        nasdaq_prev: float | None = None) -> tuple[float, str] | None:
+                        nasdaq_prev: float | None = None, nasdaq_last: float | None = None) -> tuple[float, str] | None:
     """A reverse split makes a stock look like it ran: Yahoo's intraday previous close is NOT
     split-adjusted, so a 1:35 split on a $0.10 stock shows as +3,400%. If a split took effect in the
     last few days and the apparent move matches its ratio better than "no move", re-base the previous
     close. With no split data, fall back to Nasdaq's own previous close (split-adjusted) when the two
-    disagree by 2.5x or more. Returns (adjusted_prev, note) or None when nothing needs fixing."""
+    disagree by 2.5x or more — but only if Nasdaq's price matches the live price: its screener can lag
+    a day, and a stale row must not erase a real run (WETO, 23 Nov 2026: +240% on 300M shares).
+    Returns (adjusted_prev, note) or None when nothing needs fixing."""
     if prev <= 0 or last <= 0:
         return None
     move = math.log(last / prev)
@@ -508,7 +510,7 @@ def split_adjusted_prev(prev: float, last: float, splits: list[dict], today: str
                 kind = "reverse split" if sp["factor"] > 1 else "split"
                 return prev * sp["factor"], f"{sp['ratio']} {kind} on {sp['d']} — move re-based, not a real run"
             return None
-    if nasdaq_prev and nasdaq_prev > 0:
+    if nasdaq_prev and nasdaq_prev > 0 and nasdaq_last and abs(math.log(last / nasdaq_last)) < math.log(1.25):
         r = nasdaq_prev / prev
         if (r >= 2.5 or r <= 0.4) and abs(math.log(last / nasdaq_prev)) < abs(move):
             return nasdaq_prev, "Yahoo and Nasdaq previous close disagree (likely a split) — using Nasdaq's"
@@ -1478,7 +1480,8 @@ class Scanner:
             if abs(a.day_gain) >= 0.15:
                 # a big move: rule out a reverse (or forward) split before believing it
                 fix = split_adjusted_prev(a.prev_close, a.last, self.daily_stats(sym, now).get("splits") or [],
-                                          datetime.fromtimestamp(now, NY).date().isoformat(), u.get("prev"))
+                                          datetime.fromtimestamp(now, NY).date().isoformat(),
+                                          u.get("prev"), u.get("last"))
                 if fix:
                     log.info("%s: %s (prev %s → %s)", sym, fix[1], fp(a.prev_close), fp(fix[0]))
                     s.prev_close = fix[0]
