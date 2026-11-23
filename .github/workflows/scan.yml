@@ -1,4 +1,4 @@
-name: Penny scanner
+name: Scanner under $1
 
 # Times are UTC. US premarket opens 08:00 UTC (summer) / 09:00 UTC (winter) and
 # after-hours ends 00:00 / 01:00 UTC. The script itself checks the real US session
@@ -20,7 +20,7 @@ on:
         default: auto
 
 concurrency:
-  group: penny-scanner
+  group: scanner-under-1
   cancel-in-progress: false
 
 permissions:
@@ -37,7 +37,8 @@ jobs:
       NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
       SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
       # Optional tuning — set under Settings → Secrets and variables → Actions → Variables
-      MAX_PRICE: ${{ vars.MAX_PRICE }}
+      SCANNER_NAME: "Under $1"
+      MAX_PRICE: "1"
       EXCHANGES: ${{ vars.EXCHANGES }}
       PARABOLIC_SCORE: ${{ vars.PARABOLIC_SCORE }}
       MIN_DAY_GAIN: ${{ vars.MIN_DAY_GAIN }}

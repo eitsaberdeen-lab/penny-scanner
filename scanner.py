@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Penny Stock Scanner & Alerter — NASDAQ + NYSE, under $1.
+Penny Stock Scanner & Alerter — NASDAQ + NYSE, under $1 (or any band: MIN_PRICE / MAX_PRICE, e.g. $1–$20).
 
 Catches:
   🚀 PARABOLIC   sub-$1 stocks going vertical (accelerating price + volume surge)
@@ -83,8 +83,17 @@ def _envi(name: str, default: int) -> int:
 
 
 class Config:
+    def in_range(self, price: float | None) -> bool:
+        return price is not None and self.min_price <= price < self.max_price
+
+    def range_label(self) -> str:
+        return (f"{fp(self.min_price)}–{fp(self.max_price)}" if self.min_price > 0
+                else f"under {fp(self.max_price)}")
+
     def __init__(self) -> None:
         self.max_price = _envf("MAX_PRICE", 1.00)
+        self.min_price = _envf("MIN_PRICE", 0.0)   # e.g. MIN_PRICE=1 MAX_PRICE=20 for a $1–$20 scanner
+        self.name = _env("SCANNER_NAME", "")        # optional tag on every alert, e.g. "Under $1"
         self.exchanges = [e.strip().lower() for e in _env("EXCHANGES", "nasdaq,nyse").split(",") if e.strip()]
         self.cycle_seconds = _envi("CYCLE_SECONDS", 90)
         # parabolic gates
@@ -332,7 +341,7 @@ def fetch_universe(http: Http, cfg: Config) -> dict[str, dict]:
             if not last or last <= 0:
                 continue
             prev = last - chg if last - chg > 0 else last
-            if min(last, prev) < cfg.max_price:
+            if min(last, prev) < cfg.max_price and max(last, prev) >= cfg.min_price:
                 out[sym] = {"name": name, "exchange": ex.upper(), "last": last, "prev": prev,
                             "volume": to_float(row.get("volume")) or 0, "mcap": to_float(row.get("marketCap"))}
     return out
@@ -444,18 +453,66 @@ def fetch_charts(http: Http, symbols: list[str]) -> dict[str, Series]:
     return out
 
 
+def parse_splits(res: dict | None) -> list[dict]:
+    """Yahoo split events → [{"d": "YYYY-MM-DD", "ratio": "1:35", "factor": 35.0}].
+    factor = how much one old share's price is multiplied by (1:35 reverse split → ×35; 2:1 → ×0.5)."""
+    out = []
+    for ev in (((res or {}).get("events") or {}).get("splits") or {}).values():
+        try:
+            num, den = float(ev["numerator"]), float(ev["denominator"])
+            d = datetime.fromtimestamp(int(ev["date"]), NY).date().isoformat()
+        except (KeyError, TypeError, ValueError):
+            continue
+        if num > 0 and den > 0:
+            out.append({"d": d, "ratio": ev.get("splitRatio") or f"{num:g}:{den:g}", "factor": den / num})
+    return sorted(out, key=lambda x: x["d"])
+
+
 def fetch_daily_stats(http: Http, sym: str) -> dict | None:
-    s = fetch_chart(http, sym, interval="1d", rng="3mo", prepost=False)
-    if not s or len(s.c) < 15:
+    http.prime_yahoo()
+    data = http.get_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                         params={"interval": "1d", "range": "3mo", "includePrePost": "false", "events": "split"},
+                         headers=YAHOO_HEADERS, source="yahoo")
+    if data is None:
         return None
+    res = (((data or {}).get("chart") or {}).get("result") or [None])[0]
+    splits = parse_splits(res)
+    s = parse_chart_result(res, sym)
+    if not s or len(s.c) < 15:
+        return {"sigma": None, "avgvol": None, "splits": splits}
     closes = s.c[:-1]  # exclude today's (possibly partial) bar
     rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
     rets = rets[-60:]
     vols = [v for v in s.v[:-1] if v][-60:]
     if len(rets) < 10:
-        return None
+        return {"sigma": None, "avgvol": None, "splits": splits}
     return {"sigma": statistics.pstdev(rets) or 0.05, "avgvol": statistics.mean(vols) if vols else 0,
-            "closes": [round(x, 6) for x in closes[-10:]]}
+            "closes": [round(x, 6) for x in closes[-10:]], "splits": splits}
+
+
+def split_adjusted_prev(prev: float, last: float, splits: list[dict], today: str,
+                        nasdaq_prev: float | None = None) -> tuple[float, str] | None:
+    """A reverse split makes a stock look like it ran: Yahoo's intraday previous close is NOT
+    split-adjusted, so a 1:35 split on a $0.10 stock shows as +3,400%. If a split took effect in the
+    last few days and the apparent move matches its ratio better than "no move", re-base the previous
+    close. With no split data, fall back to Nasdaq's own previous close (split-adjusted) when the two
+    disagree by 2.5x or more. Returns (adjusted_prev, note) or None when nothing needs fixing."""
+    if prev <= 0 or last <= 0:
+        return None
+    move = math.log(last / prev)
+    t = date.fromisoformat(today)
+    for sp in reversed(splits or []):
+        age = (t - date.fromisoformat(sp["d"])).days
+        if 0 <= age <= 4 and sp["factor"] != 1:
+            if abs(move - math.log(sp["factor"])) < abs(move):
+                kind = "reverse split" if sp["factor"] > 1 else "split"
+                return prev * sp["factor"], f"{sp['ratio']} {kind} on {sp['d']} — move re-based, not a real run"
+            return None
+    if nasdaq_prev and nasdaq_prev > 0:
+        r = nasdaq_prev / prev
+        if (r >= 2.5 or r <= 0.4) and abs(math.log(last / nasdaq_prev)) < abs(move):
+            return nasdaq_prev, "Yahoo and Nasdaq previous close disagree (likely a split) — using Nasdaq's"
+    return None
 
 
 def fetch_bid_ask(http: Http, sym: str) -> tuple[float, float] | None:
@@ -466,6 +523,41 @@ def fetch_bid_ask(http: Http, sym: str) -> tuple[float, float] | None:
     if bid and ask and ask >= bid > 0:
         return bid, ask
     return None
+
+
+def fetch_extended_volume(http: Http, sym: str, session: str, day: date) -> dict[int, float] | None:
+    """Yahoo's 1-minute bars carry NO volume before 9:30 or after 16:00 ET (every bar reads 0), which
+    left the volume checks unable to pass outside regular hours. Nasdaq's extended-trading feed lists
+    the latest premarket / after-hours trades (time ET, price, shares); sum them per minute.
+    Returns {minute_start_epoch: shares}, or None when the feed is unavailable."""
+    if session not in ("premarket", "afterhours"):
+        return None
+    data = http.get_json(f"https://api.nasdaq.com/api/quote/{sym}/extended-trading",
+                         params={"markettype": "pre" if session == "premarket" else "post",
+                                 "assetclass": "stocks", "time": "0"},
+                         headers=NASDAQ_HEADERS, source="nasdaq", timeout=10)
+    rows = ((((data or {}).get("data") or {}).get("tradeDetailTable") or {}).get("rows"))
+    if rows is None:
+        return None
+    out: dict[int, float] = defaultdict(float)
+    for r in rows:
+        try:
+            hh, mm = (int(x) for x in str(r.get("time", "")).split(":")[:2])
+            shares = float(str(r.get("shareVolume", "0")).replace(",", ""))
+        except ValueError:
+            continue
+        out[int(datetime.combine(day, dtime(hh, mm), NY).timestamp())] += shares
+    return dict(out)
+
+
+def fill_volume(s: Series, vols: dict[int, float]) -> int:
+    """Write per-minute volume into the bars Yahoo left empty. Returns how many bars were filled."""
+    n = 0
+    for i, t in enumerate(s.ts):
+        if not s.v[i] and (t - t % 60) in vols:
+            s.v[i] = vols[t - t % 60]
+            n += 1
+    return n
 
 
 # ─────────────────────────────── analysis ──────────────────────────────
@@ -599,6 +691,11 @@ def runner_score(a: Analysis, u: dict, daily: dict | None, cats: list, session: 
     else:
         pts += 8
     shares = (mcap / u["last"]) if mcap and u.get("last") else None
+    if not a.day_vol:
+        # no volume at all = extended-hours volume feed down (Yahoo has none there): score volume
+        # neutrally, like an unknown market cap, rather than ruling the stock out
+        pts += 10 + 6
+        why.append("volume unknown")
     if shares and a.day_vol:
         turn = a.day_vol / shares
         pts += 20 if turn >= 1 else 15 if turn >= 0.5 else 10 if turn >= 0.2 else 5 if turn >= 0.1 else 0
@@ -623,6 +720,8 @@ def runner_score(a: Analysis, u: dict, daily: dict | None, cats: list, session: 
         why.append("⚠️ black-swan news")
     if a.vwap and a.last >= a.vwap:
         pts += 10 if a.hod and a.last >= a.hod * 0.9 else 5
+    elif a.vwap is None and a.hod and a.last >= a.hod * 0.9:
+        pts += 5   # no volume → no VWAP; holding near the high is the price-only equivalent
     if 0.20 <= a.day_gain <= 0.80:
         pts += 10
     elif a.day_gain < 0.20:
@@ -655,7 +754,7 @@ def find_buy_setup(s: Series, a: Analysis, cfg: Config) -> Setup | None:
     Both avoid buying straight into a vertical spike (no pullback = no setup)."""
     t = today_slice(s)
     n = len(t.c)
-    if n < 15 or a.vwap is None or a.prev_close >= cfg.max_price or a.day_gain < cfg.min_day_gain:
+    if n < 15 or a.vwap is None or not cfg.in_range(a.prev_close) or a.day_gain < cfg.min_day_gain:
         return None
     H, L, C, O = t.h, t.l, t.c, t.o
     V = [x or 0 for x in t.v]
@@ -701,6 +800,22 @@ def find_buy_setup(s: Series, a: Analysis, cfg: Config) -> Setup | None:
             if st:
                 return st
     return None
+
+
+def runner_plan(s: Series, a: Analysis, cfg: Config) -> Setup | None:
+    """Entry / stop / targets for a RUNNER heads-up, so it doesn't have to wait for a pullback setup.
+    Stop just under the base the stock broke out of (lowest low 5–30 minutes ago), never wider than
+    MAX_RISK_PCT or tighter than MIN_RISK_PCT. Targets are the usual TARGET1_R / TARGET2_R."""
+    lows = today_slice(s).l
+    if len(lows) < 10 or a.last <= 0:
+        return None
+    base = lows[-30:-4] if len(lows) >= 34 else lows[:-4]
+    entry = a.last
+    stop = max(min(base) * 0.99, entry * (1 - cfg.max_risk_pct))
+    stop = min(stop, entry * (1 - cfg.min_risk_pct))
+    risk = entry - stop
+    return Setup("Runner", entry, stop, entry + cfg.target1_r * risk, entry + cfg.target2_r * risk, risk / entry,
+                 "Stop sits just under the base it broke out of")
 
 
 def check_exit(tr: dict, s: Series, a: Analysis, cfg: Config, now: float) -> tuple[str, str, bool] | None:
@@ -1135,7 +1250,8 @@ class Notifier:
 
     def head(self, a: Alert) -> str:
         sym = f": {a.symbol}" if a.symbol else ""
-        return f"{EMOJI[a.kind]} {LABEL[a.kind]}{sym}"
+        tag = f"[{self.cfg.name}] " if self.cfg.name else ""   # tells two scanners apart in one chat
+        return f"{tag}{EMOJI[a.kind]} {LABEL[a.kind]}{sym}"
 
     def send(self, a: Alert) -> None:
         log.info("ALERT %s %s — %s | %s", a.kind, a.symbol, a.title, " | ".join(a.lines))
@@ -1180,6 +1296,7 @@ class Scanner:
         self.cik_map: dict[str, str] = {}
         self.last_quick: dict[str, tuple] = {}
         self.runner: dict[str, tuple[float, list]] = {}
+        self.split_note: dict[str, str] = {}
 
     # ---- setup ----
     def load_universe(self) -> int:
@@ -1202,8 +1319,8 @@ class Scanner:
             self.cik_map = fresh or cik.get("map") or {}
             if fresh:
                 self.state.d["cik"] = {"d": today, "map": fresh}
-        log.info("Universe: %d stocks under %s on %s · %d mapped to SEC CIKs",
-                 len(self.universe), fp(self.cfg.max_price), "/".join(e.upper() for e in self.cfg.exchanges), len(self.cik_map))
+        log.info("Universe: %d stocks %s on %s · %d mapped to SEC CIKs",
+                 len(self.universe), self.cfg.range_label(), "/".join(e.upper() for e in self.cfg.exchanges), len(self.cik_map))
         return len(self.universe)
 
     # ---- catalysts ----
@@ -1281,12 +1398,29 @@ class Scanner:
             series.update(fetch_charts(self.http, batch))
         return series
 
+    def fill_extended_volume(self, charts: dict[str, Series], session: str, now: float) -> set[str]:
+        """Premarket / after-hours: add Nasdaq trade volume to Yahoo's volume-less bars.
+        Returns the symbols whose extended-hours volume is known."""
+        day = datetime.fromtimestamp(now, NY).date()
+        syms = list(charts)
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            res = list(pool.map(lambda sym: fetch_extended_volume(self.http, sym, session, day), syms))
+        known = set()
+        for sym, vols in zip(syms, res):
+            if vols is not None:
+                fill_volume(charts[sym], vols)
+                known.add(sym)
+        if syms and not known:
+            log.warning("Extended-hours volume feed unavailable — judging %s moves on price only", session)
+        return known
+
     def cycle(self) -> list[Alert]:
         now = self.clock()
         session = self.cfg.forced_session or session_at(now)
         ext = session != "regular"
         alerts: list[Alert] = []
         self.runner = {}
+        self.split_note = {}
         self.state.prune(now, self.cfg.exit_watch_days)
 
         # 1) catalysts first — they explain moves and can arrive before the move
@@ -1331,6 +1465,7 @@ class Scanner:
         ranked = sorted(hot, key=lambda s: (not open_trades.get(s, {}).get("open"), -heat(s)))
         deep = ranked[: self.cfg.max_deep_scans]
         charts = fetch_charts(self.http, deep)
+        vol_known = self.fill_extended_volume(charts, session, now) if ext else set(charts)
 
         for sym in deep:
             s = charts.get(sym)
@@ -1340,20 +1475,33 @@ class Scanner:
             a = analyze(s, u.get("prev"))
             if not a:
                 continue
+            if abs(a.day_gain) >= 0.15:
+                # a big move: rule out a reverse (or forward) split before believing it
+                fix = split_adjusted_prev(a.prev_close, a.last, self.daily_stats(sym, now).get("splits") or [],
+                                          datetime.fromtimestamp(now, NY).date().isoformat(), u.get("prev"))
+                if fix:
+                    log.info("%s: %s (prev %s → %s)", sym, fix[1], fp(a.prev_close), fp(fix[0]))
+                    s.prev_close = fix[0]
+                    self.split_note[sym] = fix[1]
+                    a = analyze(s, u.get("prev"))
+                    if not a:
+                        continue
             self.last_quick[sym] = (a.last, a.day_gain, a.g15)
             mindv = self.cfg.min_dv_extended if ext else self.cfg.min_dv_regular
+            if sym not in vol_known:
+                mindv = 0.0  # extended-hours volume feed down: judge on price rather than go blind
             self.runner[sym] = (0.0, [])
             if a.day_gain >= 0.15:
                 daily = self.daily_stats(sym, now)
                 self.runner[sym] = runner_score(a, u, daily, self.state.d["catalysts"].get(sym, []), session, now)
-                ra = self.runner_alert(sym, a, session, now, mindv)
+                ra = self.runner_alert(sym, s, a, session, now, mindv)
                 if ra:
                     alerts.append(ra)
             if self.cfg.trade_signals:
                 ta = self.trade_signal(sym, s, a, session, now, mindv)
                 if ta:
                     alerts.append(ta)
-            parabolic = (a.prev_close < self.cfg.max_price and a.day_gain >= self.cfg.min_day_gain
+            parabolic = (self.cfg.in_range(a.prev_close) and a.day_gain >= self.cfg.min_day_gain
                          and a.g15 >= min15 and a.dv15 >= mindv and a.score >= self.cfg.parabolic_score
                          and (a.vwap is None or a.last >= a.vwap))
             crash = a.day_gain <= self.cfg.crash_day and a.g15 <= -0.10 and a.dv15 >= mindv / 2
@@ -1386,15 +1534,21 @@ class Scanner:
             if a and not (a.kind == "CATALYST" and c.symbol in running):
                 alerts.append(a)
 
-        # 5) a RUNNER heads-up is redundant when the same stock already has a parabolic alert this cycle
+        # 5) a plain RUNNER heads-up is redundant when the same stock already has a parabolic alert this
+        #    cycle — unless it carries a buy plan that is now being tracked (keep the stop in front of you)
         para = {a.symbol for a in alerts if a.kind == "PARABOLIC"}
-        alerts = [a for a in alerts if not (a.kind == "RUNNER" and a.symbol in para)]
+        planned = {s for s, tr in open_trades.items() if tr.get("open") and tr.get("setup") == "Runner"
+                   and tr.get("ts") == now}
+        alerts = [a for a in alerts if not (a.kind == "RUNNER" and a.symbol in para and a.symbol not in planned)]
 
         # 6) rank, enrich with bid/ask, send
         alerts.sort(key=lambda x: (-x.priority, -self.runner.get(x.symbol, (0.0, []))[0]))
         out, overflow = [], []
         for a in alerts:
             (out if len(out) < self.cfg.max_alerts_per_cycle else overflow).append(a)
+        for a in out + overflow:
+            if a.symbol in self.split_note:
+                a.lines.insert(1, "⚠️ " + self.split_note[a.symbol])
         for a in out:
             if a.symbol and a.kind in ("PARABOLIC", "CRASH", "BLACKSWAN", "HALT", "CATALYST", "EXIT"):
                 ba = fetch_bid_ask(self.http, a.symbol)
@@ -1546,9 +1700,9 @@ class Scanner:
     def daily_stats(self, sym: str, now: float) -> dict:
         today = datetime.fromtimestamp(now, NY).date().isoformat()
         st = self.state.d["daily"].get(sym)
-        if not st:
+        if not st or st.get("d") != today or "splits" not in st:
             stats = fetch_daily_stats(self.http, sym)
-            st = {"d": today, **(stats or {"sigma": None, "avgvol": None})}
+            st = {"d": today, **(stats or {"sigma": None, "avgvol": None, "splits": []})}
             self.state.d["daily"][sym] = st
         return st
 
@@ -1558,12 +1712,12 @@ class Scanner:
             return None
         return f"🔥 100%+ runner potential {sc:.0f}/100" + (f" — {', '.join(why[:4])}" if why else "")
 
-    def runner_alert(self, sym: str, a: Analysis, session: str, now: float, mindv: float) -> Alert | None:
+    def runner_alert(self, sym: str, s: Series, a: Analysis, session: str, now: float, mindv: float) -> Alert | None:
         if not self.cfg.runner_alerts:
             return None
         sc, why = self.runner.get(sym, (0.0, []))
         if (sc < self.cfg.runner_score or not (0.20 <= a.day_gain < 1.0) or a.dv15 < mindv
-                or (a.vwap and a.last < a.vwap) or a.prev_close >= self.cfg.max_price):
+                or (a.vwap and a.last < a.vwap) or not self.cfg.in_range(a.prev_close)):
             return None
         if not self.state.should_alert("RUNNER", sym, a.last, now, 24 * 60, 10.0):
             return None
@@ -1571,11 +1725,41 @@ class Scanner:
         u = self.universe.get(sym, {})
         lines = [f"{SESSION_LABEL.get(session, session)} · {u.get('exchange', '')} · {u.get('name', '')}",
                  f"Price {fp(a.last)} ({pct(a.day_gain)} today · {pct(a.g15)} in 15m) · VWAP {fp(a.vwap)}",
-                 f"Runner score {sc:.0f}/100: " + (", ".join(why) if why else "momentum + volume"),
-                 "Early heads-up: room left to run. Wait for a BUY SETUP alert rather than chasing",
-                 clock_line(now)]
+                 f"Runner score {sc:.0f}/100: " + (", ".join(why) if why else "momentum + volume")]
+        lines += self.runner_buy_plan(sym, s, a, now)
+        if session != "regular":
+            lines.append("Extended hours: thin liquidity, use limit orders only")
+        lines.append(clock_line(now))
         return Alert("RUNNER", sym, f"{pct(a.day_gain)} so far, could run 100%+", lines,
                      links_for(sym, u.get("exchange", "")), 5, a.last)
+
+    def runner_buy_plan(self, sym: str, s: Series, a: Analysis, now: float) -> list[str]:
+        """Give a RUNNER alert its own buy zone + stop + targets and track it like any buy signal,
+        so STOP / TAKE PROFIT / SELL alerts follow in every session."""
+        trades = self.state.d.setdefault("trades", {})
+        tr = trades.get(sym)
+        if not self.cfg.trade_signals or (tr and tr.get("open")):
+            return []
+        plan = runner_plan(s, a, self.cfg)
+        if not plan:
+            return ["Watch only: not enough bars yet for a stop — wait for a BUY SETUP"]
+        ba = fetch_bid_ask(self.http, sym)
+        spread = (ba[1] - ba[0]) / ((ba[1] + ba[0]) / 2) if ba else None
+        if spread is not None and spread > self.cfg.max_spread:
+            return [f"Watch only: bid/ask spread {spread * 100:.1f}% is too wide for a buy plan"]
+        trades[sym] = {"d": datetime.fromtimestamp(now, NY).date().isoformat(), "ts": now, "open": True,
+                       "setup": plan.name, "entry": plan.entry, "stop": plan.stop, "t1": plan.t1, "t2": plan.t2,
+                       "high": plan.entry}
+        gain = lambda x: x / plan.entry - 1
+        out = [f"Buy zone ~{fp(plan.entry)} · Stop {fp(plan.stop)} ({pct(-plan.risk_pct)}) — {plan.note.lower()}",
+               f"Target 1 {fp(plan.t1)} ({pct(gain(plan.t1))}) · Target 2 {fp(plan.t2)} ({pct(gain(plan.t2))})"
+               " · then trail the rest"]
+        if self.cfg.risk_amount > 0:
+            shares = int(self.cfg.risk_amount / (plan.entry - plan.stop))
+            out.append(f"Size to risk ${self.cfg.risk_amount:,.0f}: ~{shares:,} shares (~${shares * plan.entry:,.0f})")
+        out.append("Spread " + (f"{spread * 100:.1f}%" if spread is not None else "unknown")
+                   + " · I'll send STOP / TAKE PROFIT / SELL alerts for this")
+        return out
 
     def zscore(self, sym: str, a: Analysis, now: float) -> float | None:
         st = self.daily_stats(sym, now)
@@ -1634,7 +1818,7 @@ class Scanner:
         if self.cfg.heartbeat and nt.get("heartbeat") != f"{today}:{session}":
             nt["heartbeat"] = f"{today}:{session}"
             self.notifier.send(Alert("INFO", "", f"online — {SESSION_LABEL.get(session, session)}",
-                                     [f"Watching {len(self.universe)} stocks under {fp(self.cfg.max_price)} on "
+                                     [f"Watching {len(self.universe)} stocks {self.cfg.range_label()} on "
                                       f"{'/'.join(e.upper() for e in self.cfg.exchanges)}",
                                       f"Sources: {self.health_line()}", clock_line(now)], [], 2))
         for src, what in (("yahoo", "Price data (Yahoo) — parabolic/crash alerts are paused"),

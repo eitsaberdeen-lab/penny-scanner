@@ -548,6 +548,97 @@ class TestRunnerPotential(unittest.TestCase):
             self.assertNotIn(("RUNNER", "ROKT"), [(a.kind, a.symbol) for a in sc.cycle()])
 
 
+
+def premarket_runner_bars(end_h=7, end_m=0, tail=None):
+    """Real Yahoo shape: premarket 1-minute bars with ZERO volume. Flat $0.40 from 04:00, takes off at 06:30."""
+    bars, t, prev = [], et(2026, 11, 9, 4, 0), 0.40
+    while t <= et(2026, 11, 9, end_h, end_m):
+        m = (t - et(2026, 11, 9, 6, 30)) / 60
+        p = 0.40 if m < 0 else 0.40 * (1 + 0.40 * min(m, 30) / 30)
+        if tail and m > 30:
+            p = tail(m - 30)
+        bars.append((int(t), prev, max(p, prev) * 1.002, min(p, prev) * 0.998, p, 0))
+        prev, t = p, t + 60
+    return bars
+
+
+class ExtendedHttp(FakeHttp):
+    """FakeHttp plus Nasdaq's extended-trading feed (premarket trades with share volume)."""
+
+    def __init__(self, feed_up=True):
+        super().__init__()
+        self.feed_up = feed_up
+        self.ext_calls = 0
+
+    def get_json(self, url, params=None, headers=None, source="web", timeout=20):
+        if "/extended-trading" in url:
+            self.ext_calls += 1
+            if not self.feed_up:
+                return None
+            rows = []
+            t = et(2026, 11, 9, 4, 0)
+            while t <= et(2026, 11, 9, 9, 29):
+                hm = datetime.fromtimestamp(t, NY)
+                shares = 2_000 if hm.hour < 6 or (hm.hour == 6 and hm.minute < 30) else 80_000
+                rows.append({"time": hm.strftime("%H:%M:15"), "price": "$0.50", "shareVolume": f"{shares:,}"})
+                t += 60
+            return {"data": {"tradeDetailTable": {"rows": rows[::-1]}}}
+        return super().get_json(url, params, headers, source, timeout)
+
+
+class TestExtendedHours(unittest.TestCase):
+    def test_extended_volume_parsed_per_minute(self):
+        class H(S.Http):
+            def get_json(self, *a, **k):
+                return {"data": {"tradeDetailTable": {"rows": [
+                    {"time": "07:01:59", "shareVolume": "1,000"}, {"time": "07:01:02", "shareVolume": "500"},
+                    {"time": "07:02:30", "shareVolume": "20"}, {"time": "bad", "shareVolume": "9"}]}}}
+        day = datetime(2026, 11, 9).date()
+        vols = S.fetch_extended_volume(H(), "X", "premarket", day)
+        self.assertEqual(vols, {int(et(2026, 11, 9, 7, 1)): 1500.0, int(et(2026, 11, 9, 7, 2)): 20.0})
+        self.assertIsNone(S.fetch_extended_volume(H(), "X", "regular", day))
+        s = series_from([(int(et(2026, 11, 9, 7, 1)), .4, .4, .4, .4, 0), (int(et(2026, 11, 9, 7, 3)), .4, .4, .4, .4, 0)])
+        self.assertEqual(S.fill_volume(s, vols), 1)
+        self.assertEqual(s.v, [1500.0, 0])
+
+    def _runner(self, http, clock):
+        http.charts["ROKT"] = chart_json("ROKT", 0.40, premarket_runner_bars(7, 0))
+        d = tempfile.mkdtemp()
+        sc, http, st = make_scanner(http, d, clock=clock)
+        sc.load_universe()
+        return sc, http, st
+
+    def test_premarket_runner_with_zero_yahoo_volume_gets_buy_plan(self):
+        sc, http, st = self._runner(ExtendedHttp(), et(2026, 11, 9, 7, 0, 30))
+        alerts = {(a.kind, a.symbol): a for a in sc.cycle()}
+        self.assertGreater(http.ext_calls, 0)
+        self.assertIn(("RUNNER", "ROKT"), alerts)
+        text = " | ".join(alerts[("RUNNER", "ROKT")].lines)
+        self.assertIn("Buy zone", text)
+        self.assertIn("Stop", text)
+        self.assertIn("limit orders", text)
+        tr = st.d["trades"]["ROKT"]
+        self.assertTrue(tr["open"])
+        self.assertEqual(tr["setup"], "Runner")
+        self.assertLess(tr["stop"], tr["entry"])
+        self.assertGreaterEqual(tr["stop"], tr["entry"] * (1 - sc.cfg.max_risk_pct) - 1e-9)
+
+    def test_runner_stop_then_fires_stop_alert(self):
+        sc, http, st = self._runner(ExtendedHttp(), et(2026, 11, 9, 7, 0, 30))
+        sc.cycle()
+        stop = st.d["trades"]["ROKT"]["stop"]
+        # price collapses below the stop by 07:10
+        http.charts["ROKT"] = chart_json("ROKT", 0.40, premarket_runner_bars(7, 10, tail=lambda m: stop * 0.9))
+        sc.clock = lambda: et(2026, 11, 9, 7, 10, 30)
+        kinds = [(a.kind, a.symbol) for a in sc.cycle()]
+        self.assertIn(("STOP", "ROKT"), kinds)
+        self.assertFalse(st.d["trades"]["ROKT"]["open"])
+
+    def test_feed_down_still_alerts_on_price(self):
+        sc, http, st = self._runner(ExtendedHttp(feed_up=False), et(2026, 11, 9, 7, 0, 30))
+        self.assertIn(("RUNNER", "ROKT"), [(a.kind, a.symbol) for a in sc.cycle()])
+
+
 def fade_bars(minutes=45, bounce=0):
     """parabolic_bars() to 08:30, then a steady fade with weak bounces (lower highs, lower lows),
     heavier volume on the down bars. Optionally finish with `bounce` minutes of a strong recovery."""
@@ -638,3 +729,75 @@ class TestExitWatch(unittest.TestCase):
             sc.load_universe()
             sc.cycle()
             self.assertEqual(st.d.get("watch"), {})
+
+
+SPLIT_DAY = et(2026, 11, 9, 0, 0)
+
+
+class SplitHttp(ExtendedHttp):
+    """ROKT did a 1:20 reverse split today: Nasdaq shows the real (adjusted) price, Yahoo's intraday
+    previous close is still the old $0.40, so the chart looks like +2,700%."""
+
+    def __init__(self, split_event=True, nasdaq_adjusted=True):
+        super().__init__()
+        self.split_event = split_event
+        self.nasdaq_adjusted = nasdaq_adjusted
+        self.charts["ROKT"] = chart_json("ROKT", 0.40, [(t, o * 20, h * 20, l * 20, c * 20, v)
+                                                        for t, o, h, l, c, v in premarket_runner_bars(7, 0)])
+
+    def get_json(self, url, params=None, headers=None, source="web", timeout=20):
+        if "screener/stocks" in url and params["exchange"] == "nasdaq":
+            rows = [dict(r) for r in UNIVERSE["data"]["rows"]]
+            if self.nasdaq_adjusted:
+                rows[0].update(lastsale="$11.20", netchange="3.20")   # Nasdaq: prev $8.00, split-adjusted
+            rows += [{"symbol": f"M{chr(65 + i // 26)}{chr(65 + i % 26)}", "name": f"Mid {i} Inc",
+                      "lastsale": "$5.00", "netchange": "0", "pctchange": "0%", "volume": "1000"} for i in range(25)]
+            return {"data": {"rows": rows}}
+        res = super().get_json(url, params, headers, source, timeout)
+        if "/v8/finance/chart/ROKT" in url and params.get("interval") == "1d":
+            res = daily_json("ROKT", 8.0)   # Yahoo daily history is split-adjusted
+            if self.split_event:
+                res["chart"]["result"][0]["events"] = {"splits": {str(int(SPLIT_DAY)): {
+                    "date": int(SPLIT_DAY), "numerator": 1, "denominator": 20, "splitRatio": "1:20"}}}
+        return res
+
+
+class TestReverseSplit(unittest.TestCase):
+    def test_split_adjusted_prev(self):
+        sp = [{"d": "2026-11-18", "ratio": "1:35", "factor": 35.0}]
+        fix = S.split_adjusted_prev(0.097, 3.50, sp, "2026-11-18")
+        self.assertAlmostEqual(fix[0], 0.097 * 35)
+        self.assertIn("1:35 reverse split", fix[1])
+        self.assertIsNone(S.split_adjusted_prev(0.097, 3.50, sp, "2026-11-30"))      # old split: not today's move
+        self.assertIsNone(S.split_adjusted_prev(0.20, 0.30, sp, "2026-11-18"))       # real +50%, price never jumped ×35
+        self.assertIsNone(S.split_adjusted_prev(0.20, 0.45, [], "2026-11-18", 0.20))  # real run, Nasdaq agrees
+        fb = S.split_adjusted_prev(0.10, 2.10, [], "2026-11-18", 2.00)               # no split data: Nasdaq fallback
+        self.assertEqual(fb[0], 2.00)
+        fwd = S.split_adjusted_prev(10.0, 5.1, [{"d": "2026-11-18", "ratio": "2:1", "factor": 0.5}], "2026-11-18")
+        self.assertAlmostEqual(fwd[0], 5.0)                                          # forward split isn't a crash
+
+    def _kinds(self, http, min_price=0.0, max_price=1.0):
+        d = tempfile.mkdtemp()
+        sc, http, st = make_scanner(http, d, clock=et(2026, 11, 9, 7, 0, 30))
+        sc.cfg.min_price, sc.cfg.max_price = min_price, max_price
+        sc.load_universe()
+        return sc, {(a.kind, a.symbol): a for a in sc.cycle()}
+
+    def test_reverse_split_is_not_a_runner_under_1(self):
+        # early premarket on split day Nasdaq may still list the old $0.40 price, so the stock IS in the
+        # under-$1 universe and only Yahoo's split event can unmask the fake +2,700%
+        for event, adjusted in ((True, False), (True, True), (False, True)):
+            sc, alerts = self._kinds(SplitHttp(split_event=event, nasdaq_adjusted=adjusted))
+            self.assertEqual("ROKT" in sc.universe, not adjusted)
+            for kind in ("PARABOLIC", "RUNNER", "BUY"):
+                self.assertNotIn((kind, "ROKT"), alerts, f"split_event={event}")
+
+    def test_1_to_20_band_sees_real_move_after_split(self):
+        sc, alerts = self._kinds(SplitHttp(), 1.0, 20.0)
+        self.assertIn("ROKT", sc.universe)
+        self.assertNotIn("FLAT", sc.universe)     # $0.55 belongs to the under-$1 scanner
+        self.assertNotIn("BIGC", sc.universe)     # $45 is above the band
+        a = alerts.get(("RUNNER", "ROKT"))
+        self.assertIsNotNone(a)
+        self.assertIn("1:20 reverse split", " | ".join(a.lines))
+        self.assertLess(sc.last_quick["ROKT"][1], 0.5)   # real +40%, not +2,700%
