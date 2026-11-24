@@ -889,3 +889,51 @@ class TestUpsideOnly(unittest.TestCase):
             self.assertTrue(all(a.symbol != "DOWN" for a in swan))
             self.assertIn("Buy zone", " ".join(swan[0].lines))
 
+class TestNearHighAndScorecard(unittest.TestCase):
+    def make(self, d):
+        sc, http, st = make_scanner(None, d)
+        sc.cfg.upside_only, sc.cfg.exit_alerts = True, False
+        sc.load_universe()
+        return sc, http, st
+
+    def test_fading_stock_is_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            sc, http, st = self.make(d)
+            sc.cfg.near_high = -1.0           # nothing can be "near" the high → every up-move counts as fading
+            self.assertEqual([a for a in sc.cycle() if a.kind in ("PARABOLIC", "BLACKSWAN")], [])
+
+    def test_plan_outcome(self):
+        plan = {"entry": 1.0, "stop": 0.86, "t1": 1.28, "t2": 1.42}
+        bar = lambda h, lo: (0, h, lo, (h + lo) / 2)
+        self.assertEqual(S.plan_outcome(plan, [bar(1.05, 0.95), bar(1.30, 1.0)]), "Target 1 reached")
+        self.assertEqual(S.plan_outcome(plan, [bar(1.30, 1.0), bar(1.45, 1.2)]), "Target 2 reached")
+        self.assertEqual(S.plan_outcome(plan, [bar(1.05, 0.85), bar(1.50, 1.2)]), "Stopped out")
+        self.assertEqual(S.plan_outcome(plan, [bar(1.30, 0.80)]), "Stopped out")     # both in one bar: cautious
+        self.assertEqual(S.plan_outcome(plan, [bar(1.10, 0.90)]), "Open: neither stop nor Target 1")
+        self.assertEqual(S.plan_outcome({}, [bar(1.1, 0.9)]), "no plan")
+
+    def test_scorecard_records_alerts_and_exits_and_sends_once(self):
+        with tempfile.TemporaryDirectory() as d:
+            sc, http, st = self.make(d)
+            alerts = sc.cycle()
+            rokt = next(a for a in alerts if a.symbol == "ROKT")
+            day = datetime.fromtimestamp(NOW, S.NY).date().isoformat()
+            book = st.d["scorecard"][day]
+            rec = next(r for r in book["alerts"] if r["sym"] == "ROKT")
+            self.assertEqual(rec["price"], rokt.price)
+            self.assertTrue(rec["plan"].get("stop"))
+            # an exit alert is attached to the alert it belongs to
+            sc.score_record(S.Alert("STOP", "ROKT", "x", ["Stop hit"], [], 5, 0.8), NOW + 600)
+            self.assertEqual(rec["exits"][0]["kind"], "STOP")
+            # not due during the day, due late after-hours, then never again
+            self.assertEqual(sc.scorecard_due("regular", NOW), [])
+            late = datetime.fromtimestamp(NOW, S.NY).replace(hour=19, minute=45).timestamp()
+            self.assertEqual(sc.scorecard_due("afterhours", late), [day])
+            card = sc.build_scorecard(day, late)
+            text = " ".join(card.lines)
+            self.assertIn("ROKT", text)
+            self.assertIn("STOP HIT", text)
+            self.assertIn("reached Target 1", card.lines[0])
+            book["sent"] = True
+            self.assertEqual(sc.scorecard_due("afterhours", late), [])
+

@@ -144,6 +144,10 @@ class Config:
         self.dt_min_dv15_regular = _envf("DAYTRADE_MIN_DOLLAR_VOL_15M_REGULAR", 100_000)
         self.dt_min_dv15_extended = _envf("DAYTRADE_MIN_DOLLAR_VOL_15M_EXTENDED", 25_000)
         self.dt_min_rel_vol = _envf("DAYTRADE_MIN_REL_VOL", 2.0)
+        # still running, not fading: price within this much of the day's high (LGHL / BENF, 24 Nov 2026,
+        # were alerted 43% / 12% under a premarket peak)
+        self.near_high = _envf("NEAR_HIGH_PCT", 0.10)
+        self.scorecard = _env("SCORECARD", "on").lower() != "off"   # end-of-day results of every alert
         # every upside alert has its own stop + exits, so the older "exit watch" is off by default there
         self.exit_alerts = _env("EXIT_ALERTS", "off" if self.upside_only else "on").lower() != "off"
         self.exit_watch_kinds = {k.strip().upper() for k in _env("EXIT_WATCH_KINDS", "PARABOLIC,BLACKSWAN").split(",")
@@ -843,6 +847,37 @@ def runner_plan(s: Series, a: Analysis, cfg: Config) -> Setup | None:
                  "Stop sits just under the base it broke out of")
 
 
+def fetch_day_bars(http: Http, sym: str, day: str) -> list[tuple[int, float, float, float]]:
+    """(ts, high, low, close) 1-minute bars incl. pre/after-hours for one ET date (last 5 days)."""
+    http.prime_yahoo()
+    data = http.get_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
+                         params={"interval": "1m", "range": "5d", "includePrePost": "true"},
+                         headers=YAHOO_HEADERS, source="yahoo")
+    res = (((data or {}).get("chart") or {}).get("result") or [None])[0]
+    s = parse_chart_result(res, sym) if res else None
+    if not s:
+        return []
+    return [(t, h, lo, c) for t, h, lo, c in zip(s.ts, s.h, s.l, s.c)
+            if h and lo and c and datetime.fromtimestamp(t, NY).date().isoformat() == day]
+
+
+def plan_outcome(plan: dict, bars: list[tuple[int, float, float, float]]) -> str:
+    """What the buy plan did on real bars: the first of stop / target 1 to be touched (a bar touching
+    both counts as stopped — the cautious reading), then whether target 2 followed."""
+    if not plan.get("stop") or not plan.get("t1"):
+        return "no plan"
+    t1 = False
+    for _, h, lo, _ in bars:
+        if not t1:
+            if lo <= plan["stop"]:
+                return "Stopped out"
+            if h >= plan["t1"]:
+                t1 = True
+        if t1 and plan.get("t2") and h >= plan["t2"]:
+            return "Target 2 reached"
+    return "Target 1 reached" if t1 else "Open: neither stop nor Target 1"
+
+
 def check_exit(tr: dict, s: Series, a: Analysis, cfg: Config, now: float) -> tuple[str, str, bool] | None:
     """Return (kind, reason, closes_trade) for an open buy signal, updating the trade in place.
     kind: STOP | TRIM | SELL"""
@@ -1199,6 +1234,8 @@ class State:
         self.d["daily"] = {s: v for s, v in self.d["daily"].items() if v.get("d") == today}
         self.d["trades"] = {s: t for s, t in self.d.get("trades", {}).items() if t.get("d") == today}
         self.d["watch"] = {s: w for s, w in self.d.get("watch", {}).items() if now - w["t"] < watch_days * 86400}
+        cutoff = (datetime.fromtimestamp(now, NY).date() - timedelta(days=5)).isoformat()
+        self.d["scorecard"] = {d: b for d, b in self.d.get("scorecard", {}).items() if d >= cutoff}
 
     def watch(self, kind: str, sym: str, price: float | None, now: float) -> None:
         """Put a PARABOLIC / BLACK SWAN stock on the exit watchlist (a new alert restarts the watch)."""
@@ -1548,6 +1585,9 @@ class Scanner:
                      and a.dv15 >= mindv / 2)
             if not (parabolic or up_swan or crash):
                 continue
+            if (parabolic or up_swan) and self.cfg.upside_only and a.hod and a.last < a.hod * (1 - self.cfg.near_high):
+                log.info("%s skipped: fading, %s below the day's high %s", sym, pct(a.last / a.hod - 1), fp(a.hod))
+                continue
             if parabolic or up_swan:
                 kind = "BLACKSWAN" if up_swan else "PARABOLIC"
                 grade = self.upside_grade(sym, a, ext, sym in vol_known) if self.cfg.upside_only else None
@@ -1597,6 +1637,8 @@ class Scanner:
         for a in out + overflow:
             if a.symbol in self.split_note:
                 a.lines.insert(1, "⚠️ " + self.split_note[a.symbol])
+        for a in out + overflow:
+            self.score_record(a, now)
         for a in out:
             if a.symbol and a.kind in ("PARABOLIC", "CRASH", "BLACKSWAN", "HALT", "CATALYST", "EXIT"):
                 ba = fetch_bid_ask(self.http, a.symbol)
@@ -1609,6 +1651,13 @@ class Scanner:
             if a.kind in ("PARABOLIC", "CRASH", "BLACKSWAN"):
                 self.state.record_alert(a.kind, a.symbol, a.price, now)
             self.add_to_watch(a, now)
+        if self.cfg.scorecard:
+            for day in self.scorecard_due(session, now):
+                try:
+                    self.notifier.send(self.build_scorecard(day, now))
+                except Exception:  # a scorecard must never break the scan
+                    log.exception("Scorecard %s failed", day)
+                self.state.d["scorecard"][day]["sent"] = True
         if overflow:
             self.notifier.send(Alert("INFO", "", f"{len(overflow)} more signals this cycle",
                                      [", ".join(f"{EMOJI[a.kind]} {a.symbol}" for a in overflow)], [], 2))
@@ -1617,6 +1666,78 @@ class Scanner:
                     self.state.record_alert(a.kind, a.symbol, a.price, now)
                 self.add_to_watch(a, now)
         return out + overflow
+
+    # ---- scorecard ----
+    def score_record(self, a: Alert, now: float) -> None:
+        """Remember each PARABOLIC / BLACK SWAN alert (with its plan) and every STOP / TAKE PROFIT / SELL
+        that followed, so the end-of-day scorecard can show what really happened."""
+        if not (self.cfg.scorecard and a.symbol):
+            return
+        day = datetime.fromtimestamp(now, NY).date().isoformat()
+        book = self.state.d.setdefault("scorecard", {}).setdefault(day, {"sent": False, "alerts": []})
+        if a.kind in ("PARABOLIC", "BLACKSWAN"):
+            tr = self.state.d.get("trades", {}).get(a.symbol) or {}
+            grade = next((ln.split(":", 1)[0].split(" ", 1)[-1] for ln in a.lines
+                          if ln.startswith(("🔥 Multibagger", "⚡ Day trade"))), "")
+            q = self.last_quick.get(a.symbol)
+            prev = q[0] / (1 + q[1]) if q and q[1] > -1 else self.universe.get(a.symbol, {}).get("prev")
+            book["alerts"].append({"sym": a.symbol, "kind": a.kind, "t": now, "price": a.price, "grade": grade,
+                                   "prev": prev,
+                                   "plan": {k: tr[k] for k in ("entry", "stop", "t1", "t2") if k in tr} if tr.get("open") else {},
+                                   "exits": []})
+        elif a.kind in ("STOP", "TRIM", "SELL"):
+            for rec in reversed(book["alerts"]):
+                if rec["sym"] == a.symbol:
+                    rec["exits"].append({"t": now, "kind": a.kind, "price": a.price, "why": a.lines[0] if a.lines else ""})
+                    break
+
+    def scorecard_due(self, session: str | None, now: float) -> list[str]:
+        """Days whose scorecard should go out now: today once after-hours is nearly over (19:40 ET),
+        or any earlier day that was missed."""
+        t = datetime.fromtimestamp(now, NY)
+        today = t.date().isoformat()
+        due = []
+        for day, book in sorted(self.state.d.get("scorecard", {}).items()):
+            if book.get("sent") or not book.get("alerts"):
+                continue
+            if day < today or (session == "afterhours" and t.time() >= dtime(19, 40)):
+                due.append(day)
+        return due
+
+    def build_scorecard(self, day: str, now: float) -> Alert:
+        book = self.state.d["scorecard"][day]
+        lines, n, t1n, stopn, big, best = [], 0, 0, 0, 0, []
+        for rec in book["alerts"]:
+            n += 1
+            sym, price = rec["sym"], rec["price"] or 0
+            bars = fetch_day_bars(self.http, sym, day)
+            after = [(ts, h, lo, c) for ts, h, lo, c in bars if ts >= rec["t"] - 60]
+            when = datetime.fromtimestamp(rec["t"], NY).strftime("%H:%M ET")
+            head = f"{EMOJI.get(rec['kind'], '')} {sym} {when} @ {fp(price)}" + (f" ({rec['grade']})" if rec["grade"] else "")
+            if not after or price <= 0:
+                lines.append(head + " → no price data")
+                continue
+            hi = max(h for _, h, _, _ in after)
+            close = after[-1][3]
+            best.append(hi / price - 1)
+            outcome = plan_outcome(rec.get("plan") or {}, after)
+            if outcome.startswith("Target"):
+                t1n += 1
+            elif outcome.startswith("Stopped"):
+                stopn += 1
+            day_hi = max(h for _, h, _, _ in bars)
+            prev = rec.get("prev") or None
+            if prev and day_hi >= 2 * prev:
+                big += 1
+            lines.append(f"{head} → best {fp(hi)} ({pct(hi / price - 1)}), close {fp(close)} ({pct(close / price - 1)}) · {outcome}")
+            for ex in rec["exits"]:
+                lines.append(f"   {EMOJI.get(ex['kind'], '')} {LABEL.get(ex['kind'], ex['kind'])} "
+                             f"{datetime.fromtimestamp(ex['t'], NY):%H:%M} @ {fp(ex['price'])} — {ex['why']}")
+            if rec.get("plan") and not rec["exits"]:
+                lines.append("   no exit alert was sent")
+        summary = (f"{n} alerts · reached Target 1: {t1n} · stopped out: {stopn} · ran 100%+ on the day: {big}"
+                   + (f" · avg best move {pct(sum(best) / len(best))}" if best else ""))
+        return Alert("INFO", "", f"scorecard {day}", [summary] + lines + [clock_line(now)], [], 3)
 
     # ---- exit watch ----
     def add_to_watch(self, a: Alert, now: float) -> None:
