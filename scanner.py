@@ -2,6 +2,10 @@
 """
 Penny Stock Scanner & Alerter — NASDAQ + NYSE, under $1 (or any band: MIN_PRICE / MAX_PRICE, e.g. $1–$20).
 
+UPSIDE_ONLY=on (default): only 🚀 PARABOLIC and 🦢 BLACK SWAN moves UP that are a possible
+multibagger or a liquid day-trade mover, each with buy zone / stop / targets and follow-up
+STOP / TAKE PROFIT / SELL alerts. UPSIDE_ONLY=off restores the full set below.
+
 Catches:
   🚀 PARABOLIC   sub-$1 stocks going vertical (accelerating price + volume surge)
   ⚡ CATALYST    fresh 8-K / 6-K / offering / merger filings and press releases
@@ -106,6 +110,9 @@ class Config:
         # black swan / crash
         self.sigma = _envf("BLACK_SWAN_SIGMA", 4.0)
         self.crash_day = _envf("CRASH_DAY_DROP", -0.35)
+        # a price-only black swan must hit a stock that wasn't already falling: down this much
+        # over the last ~10 sessions means today's drop is the trend continuing → CRASH instead
+        self.swan_prior_drop = _envf("BLACK_SWAN_MAX_PRIOR_DROP", 0.20)
         # catalysts
         self.catalyst_min_weight = _envi("CATALYST_MIN_WEIGHT", 3)
         self.catalyst_max_age_min = _envi("CATALYST_MAX_AGE_MIN", 60)
@@ -130,7 +137,15 @@ class Config:
         self.runner_score = _envf("RUNNER_SCORE", 70)
         self.runner_alerts = _env("RUNNER_ALERTS", "on").lower() != "off"
         # exit alerts for stocks that were flagged PARABOLIC / BLACK SWAN
-        self.exit_alerts = _env("EXIT_ALERTS", "on").lower() != "off"
+        # upside only (default): alert ONLY on 🚀 PARABOLIC and 🦢 BLACK SWAN moves UP, and only when the
+        # stock is a possible multibagger or a liquid day-trade mover. Every alert carries a buy zone,
+        # stop and targets, followed by STOP / TAKE PROFIT / SELL alerts. No crash / halt / news alerts.
+        self.upside_only = _env("UPSIDE_ONLY", "on").lower() != "off"
+        self.dt_min_dv15_regular = _envf("DAYTRADE_MIN_DOLLAR_VOL_15M_REGULAR", 100_000)
+        self.dt_min_dv15_extended = _envf("DAYTRADE_MIN_DOLLAR_VOL_15M_EXTENDED", 25_000)
+        self.dt_min_rel_vol = _envf("DAYTRADE_MIN_REL_VOL", 2.0)
+        # every upside alert has its own stop + exits, so the older "exit watch" is off by default there
+        self.exit_alerts = _env("EXIT_ALERTS", "off" if self.upside_only else "on").lower() != "off"
         self.exit_watch_kinds = {k.strip().upper() for k in _env("EXIT_WATCH_KINDS", "PARABOLIC,BLACKSWAN").split(",")
                                  if k.strip()}
         self.exit_watch_days = _envi("EXIT_WATCH_DAYS", 5)        # keep watching this many days after the alert
@@ -488,6 +503,14 @@ def fetch_daily_stats(http: Http, sym: str) -> dict | None:
         return {"sigma": None, "avgvol": None, "splits": splits}
     return {"sigma": statistics.pstdev(rets) or 0.05, "avgvol": statistics.mean(vols) if vols else 0,
             "closes": [round(x, 6) for x in closes[-10:]], "splits": splits}
+
+
+def prior_trend(closes: list[float] | None) -> float | None:
+    """Change over the daily closes before today (up to 10 sessions), e.g. -0.33 = already down 33%."""
+    cl = [c for c in (closes or []) if c and c > 0]
+    if len(cl) < 5:
+        return None
+    return cl[-1] / cl[0] - 1
 
 
 def split_adjusted_prev(prev: float, last: float, splits: list[dict], today: str,
@@ -1497,26 +1520,48 @@ class Scanner:
             if a.day_gain >= 0.15:
                 daily = self.daily_stats(sym, now)
                 self.runner[sym] = runner_score(a, u, daily, self.state.d["catalysts"].get(sym, []), session, now)
-                ra = self.runner_alert(sym, s, a, session, now, mindv)
+                ra = None if self.cfg.upside_only else self.runner_alert(sym, s, a, session, now, mindv)
                 if ra:
                     alerts.append(ra)
             if self.cfg.trade_signals:
-                ta = self.trade_signal(sym, s, a, session, now, mindv)
+                # upside-only: manage the plans already sent (stop / take profit / sell), no separate BUY alerts
+                ta = self.trade_signal(sym, s, a, session, now, mindv, open_new=not self.cfg.upside_only)
                 if ta:
                     alerts.append(ta)
+            above_vwap = a.vwap is None or a.last >= a.vwap
             parabolic = (self.cfg.in_range(a.prev_close) and a.day_gain >= self.cfg.min_day_gain
                          and a.g15 >= min15 and a.dv15 >= mindv and a.score >= self.cfg.parabolic_score
-                         and (a.vwap is None or a.last >= a.vwap))
-            crash = a.day_gain <= self.cfg.crash_day and a.g15 <= -0.10 and a.dv15 >= mindv / 2
-            if not (parabolic or crash):
+                         and above_vwap)
+            big = a.day_gain >= self.cfg.min_day_gain or a.day_gain <= self.cfg.crash_day
+            z = self.zscore(sym, a, now) if big else None
+            # upside black swan: a statistically extreme move UP (>= BLACK_SWAN_SIGMA vs 60-day volatility)
+            # that is holding; a gap-and-go doesn't need the 15-minute acceleration a parabolic needs
+            up_swan = (self.cfg.upside_only and z is not None and z >= self.cfg.sigma
+                       and self.cfg.in_range(a.prev_close) and a.day_gain >= self.cfg.min_day_gain
+                       and a.dv15 >= mindv and above_vwap)
+            # a multibagger candidate climbing steadily (no 15-minute spike) still counts as parabolic
+            if (self.cfg.upside_only and not parabolic and a.day_gain >= 0.20 and above_vwap
+                    and a.dv15 >= mindv and self.cfg.in_range(a.prev_close)
+                    and self.runner.get(sym, (0.0, []))[0] >= self.cfg.runner_score):
+                parabolic = True
+            crash = (not self.cfg.upside_only and a.day_gain <= self.cfg.crash_day and a.g15 <= -0.10
+                     and a.dv15 >= mindv / 2)
+            if not (parabolic or up_swan or crash):
                 continue
-            z = self.zscore(sym, a, now)
-            if parabolic and self.state.should_alert("PARABOLIC", sym, a.last, now, self.cfg.cooldown_min, self.cfg.realert_gain):
-                alerts.append(self.parabolic_alert(sym, a, z, session, now))
-            elif crash:
-                kind = "BLACKSWAN" if z is not None and z <= -self.cfg.sigma else "CRASH"
+            if parabolic or up_swan:
+                kind = "BLACKSWAN" if up_swan else "PARABOLIC"
+                grade = self.upside_grade(sym, a, ext, sym in vol_known) if self.cfg.upside_only else None
+                if self.cfg.upside_only and not grade:
+                    log.info("%s %s skipped: neither multibagger potential nor a liquid day-trade mover", sym, kind)
+                    continue
                 if self.state.should_alert(kind, sym, a.last, now, self.cfg.cooldown_min, self.cfg.realert_gain):
-                    alerts.append(self.crash_alert(kind, sym, a, z, session, now))
+                    alerts.append(self.parabolic_alert(sym, a, z, session, now, kind=kind, grade=grade, s=s))
+            elif crash:
+                trend = prior_trend(self.daily_stats(sym, now).get("closes"))
+                falling = trend is not None and trend <= -self.cfg.swan_prior_drop
+                kind = "BLACKSWAN" if z is not None and z <= -self.cfg.sigma and not falling else "CRASH"
+                if self.state.should_alert(kind, sym, a.last, now, self.cfg.cooldown_min, self.cfg.realert_gain):
+                    alerts.append(self.crash_alert(kind, sym, a, z, session, now, trend if falling else None))
 
         # 3b) exit watch: stocks flagged PARABOLIC / BLACK SWAN in the last few days
         if self.cfg.exit_alerts:
@@ -1533,7 +1578,7 @@ class Scanner:
                 px = q[0] if q else None
                 alerts.append(self.exit_alert("SELL", c.symbol, tr, px, f"Bad news after your buy: {c.title}",
                                               session, now))
-            a = self.catalyst_alert(c, now)
+            a = None if self.cfg.upside_only else self.catalyst_alert(c, now)
             if a and not (a.kind == "CATALYST" and c.symbol in running):
                 alerts.append(a)
 
@@ -1634,7 +1679,8 @@ class Scanner:
         return Alert("EXIT", sym, f"{pct(move)} since alert, now {fp(a.last)}", lines,
                      links_for(sym, u.get("exchange", "")), 5, a.last)
 
-    def trade_signal(self, sym: str, s: Series, a: Analysis, session: str, now: float, mindv: float) -> Alert | None:
+    def trade_signal(self, sym: str, s: Series, a: Analysis, session: str, now: float, mindv: float,
+                     open_new: bool = True) -> Alert | None:
         trades = self.state.d.setdefault("trades", {})
         tr = trades.get(sym)
         if tr and tr.get("open"):
@@ -1645,6 +1691,8 @@ class Scanner:
             if closes:
                 tr["open"] = False
             return self.exit_alert(kind, sym, tr, a.last, reason, session, now)
+        if not open_new:
+            return None
         if tr and now - tr.get("closed_ts", tr["ts"]) < self.cfg.cooldown_min * 60:
             return None  # one fresh setup per stock per cooldown window
         if a.dv15 < mindv:
@@ -1736,14 +1784,14 @@ class Scanner:
         return Alert("RUNNER", sym, f"{pct(a.day_gain)} so far, could run 100%+", lines,
                      links_for(sym, u.get("exchange", "")), 5, a.last)
 
-    def runner_buy_plan(self, sym: str, s: Series, a: Analysis, now: float) -> list[str]:
+    def runner_buy_plan(self, sym: str, s: Series, a: Analysis, now: float, plan: Setup | None = None) -> list[str]:
         """Give a RUNNER alert its own buy zone + stop + targets and track it like any buy signal,
         so STOP / TAKE PROFIT / SELL alerts follow in every session."""
         trades = self.state.d.setdefault("trades", {})
         tr = trades.get(sym)
         if not self.cfg.trade_signals or (tr and tr.get("open")):
             return []
-        plan = runner_plan(s, a, self.cfg)
+        plan = plan or runner_plan(s, a, self.cfg)
         if not plan:
             return ["Watch only: not enough bars yet for a stop — wait for a BUY SETUP"]
         ba = fetch_bid_ask(self.http, sym)
@@ -1770,7 +1818,43 @@ class Scanner:
             return None
         return math.log(a.last / a.prev_close) / st["sigma"]
 
-    def parabolic_alert(self, sym: str, a: Analysis, z: float | None, session: str, now: float) -> Alert:
+    def upside_grade(self, sym: str, a: Analysis, ext: bool, vol_known: bool) -> tuple[str, str] | None:
+        """Is this up-move worth an alert? ("Multibagger", why) when the 100%+ runner score is high,
+        ("Day trade", why) when it is liquid and in play (dollar volume, relative volume, tight
+        spread, holding above VWAP), else None."""
+        sc, why = self.runner.get(sym, (0.0, []))
+        if sc >= self.cfg.runner_score:
+            return "Multibagger", f"100%+ runner potential {sc:.0f}/100" + (f" - {', '.join(why[:4])}" if why else "")
+        min_dv = self.cfg.dt_min_dv15_extended if ext else self.cfg.dt_min_dv15_regular
+        if vol_known and a.dv15 < min_dv:
+            return None
+        if a.rel_vol is not None and a.rel_vol < self.cfg.dt_min_rel_vol:
+            return None
+        if a.vwap is not None and a.last < a.vwap:
+            return None
+        ba = fetch_bid_ask(self.http, sym)
+        spread = (ba[1] - ba[0]) / ((ba[1] + ba[0]) / 2) if ba else None
+        if spread is not None and spread > self.cfg.max_spread:
+            return None
+        bits = [f"15m $ volume {human(a.dv15)}" if vol_known else "volume feed down",
+                f"{a.rel_vol:.1f}x rel vol" if a.rel_vol else None,
+                f"spread {spread * 100:.1f}%" if spread is not None else None,
+                "above VWAP" if a.vwap else None]
+        return "Day trade", "high momentum - " + ", ".join(b for b in bits if b)
+
+    def upside_plan_lines(self, sym: str, s: Series, a: Analysis, now: float) -> list[str]:
+        """Buy zone / stop / targets for a PARABOLIC or BLACK SWAN alert (tracked for STOP / TAKE PROFIT /
+        SELL alerts), or the plan already running for this stock."""
+        tr = self.state.d.get("trades", {}).get(sym)
+        if tr and tr.get("open"):
+            return [f"Already tracking: buy ~{fp(tr['entry'])} · stop {fp(tr['stop'])} · "
+                    f"targets {fp(tr['t1'])} / {fp(tr['t2'])}" + (" (target 1 hit)" if tr.get("t1_hit") else "")]
+        setup = find_buy_setup(s, a, self.cfg)   # a clean pullback / VWAP entry beats buying the spike
+        return self.runner_buy_plan(sym, s, a, now, setup)
+
+    def parabolic_alert(self, sym: str, a: Analysis, z: float | None, session: str, now: float,
+                        kind: str = "PARABOLIC", grade: tuple[str, str] | None = None,
+                        s: Series | None = None) -> Alert:
         u = self.universe.get(sym, {})
         cat = self.state.best_catalyst(sym)
         if not cat:
@@ -1782,10 +1866,19 @@ class Scanner:
                  f"15m $ volume {human(a.dv15)} · rel vol {('%.1fx' % a.rel_vol) if a.rel_vol else 'n/a'} · accel {a.accel:.1f}x"]
         if z is not None and abs(z) >= self.cfg.sigma:
             lines.append(f"🦢 {z:+.1f}σ move vs its 60-day volatility")
-        rl = self.runner_line(sym)
-        if rl:
-            lines.insert(1, rl)
-        if self.cfg.trade_signals and a.vwap and a.last >= a.vwap * 1.3:
+        if grade:
+            lines.insert(1, f"{'🔥' if grade[0] == 'Multibagger' else '⚡'} {grade[0]}: {grade[1]}")
+        else:
+            rl = self.runner_line(sym)
+            if rl:
+                lines.insert(1, rl)
+        if self.cfg.upside_only and s is not None and self.cfg.trade_signals:
+            if a.vwap and a.last >= a.vwap * 1.3:
+                lines.append(f"Extended {pct(a.last / a.vwap - 1)} above VWAP: small size; a dip toward VWAP is a safer entry")
+            lines += self.upside_plan_lines(sym, s, a, now)
+            if session != "regular":
+                lines.append("Extended hours: thin liquidity, use limit orders only")
+        elif self.cfg.trade_signals and a.vwap and a.last >= a.vwap * 1.3:
             lines.append(f"Extended {pct(a.last / a.vwap - 1)} above VWAP — don't chase; wait for a BUY SETUP alert")
         if cat:
             lines.append(f"Catalyst: {cat['title']} ({cat['src']}, {age_str(now - cat['ts'])})")
@@ -1793,15 +1886,18 @@ class Scanner:
             lines.append("No catalyst found — momentum / possible pump, size carefully")
         lines.append(clock_line(now))
         prio = 5 if (cat and cat["w"] >= 4) or (z and z >= self.cfg.sigma) else 4
-        return Alert("PARABOLIC", sym, f"{pct(a.day_gain)} to {fp(a.last)}", lines, links_for(sym, u.get("exchange", "")),
+        return Alert(kind, sym, f"{pct(a.day_gain)} to {fp(a.last)}", lines, links_for(sym, u.get("exchange", "")),
                      prio, a.last)
 
-    def crash_alert(self, kind: str, sym: str, a: Analysis, z: float | None, session: str, now: float) -> Alert:
+    def crash_alert(self, kind: str, sym: str, a: Analysis, z: float | None, session: str, now: float,
+                    prior: float | None = None) -> Alert:
         u = self.universe.get(sym, {})
         cat = self.state.best_catalyst(sym) or (self.symbol_news(sym, now) and self.state.best_catalyst(sym))
         lines = [f"{SESSION_LABEL.get(session, session)} · {u.get('exchange', '')} · {u.get('name', '')}",
                  f"Price {fp(a.last)}  ({pct(a.day_gain)} today · {pct(a.g15)} in 15m)",
                  f"15m $ volume {human(a.dv15)}" + (f" · {z:+.1f}σ move" if z is not None else "")]
+        if prior is not None:
+            lines.append(f"Continuing downtrend: already {pct(prior)} over the last 10 sessions — not a black swan")
         if cat:
             lines.append(f"Likely cause: {cat['title']} ({cat['src']})")
         lines.append(clock_line(now))

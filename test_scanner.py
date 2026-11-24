@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import os  # noqa: E402
+os.environ.setdefault("UPSIDE_ONLY", "off")  # most tests cover the full alert set; TestUpsideOnly turns it on
 import scanner as S  # noqa: E402
 
 NY = S.NY
@@ -803,3 +805,87 @@ class TestReverseSplit(unittest.TestCase):
         self.assertIsNotNone(a)
         self.assertIn("1:20 reverse split", " | ".join(a.lines))
         self.assertLess(sc.last_quick["ROKT"][1], 0.5)   # real +40%, not +2,700%
+
+class TestBlackSwanTrend(unittest.TestCase):
+    """A price-only black swan must not be a stock that was already crashing (SRTM / SAFX, 24 Nov 2026)."""
+
+    def test_prior_trend(self):
+        srtm = [1.53, 1.575, 1.287, 1.305, 1.098, 1.125, 1.161, 0.882, 0.756, 1.03]   # real closes
+        safx = [0.078, 0.072, 0.07, 0.072, 0.078, 0.045, 0.05, 0.046, 0.042, 0.052]
+        self.assertLess(S.prior_trend(srtm), -0.20)
+        self.assertLess(S.prior_trend(safx), -0.20)
+        self.assertGreater(S.prior_trend([0.5, 0.52, 0.49, 0.51, 0.5, 0.5]), -0.20)  # flat: still a swan
+        self.assertIsNone(S.prior_trend([0.5, 0.4]))                                  # too little history
+        self.assertIsNone(S.prior_trend(None))
+
+    def test_falling_stock_is_crash_not_swan(self):
+        with tempfile.TemporaryDirectory() as d:
+            sc, http, st = make_scanner(None, d)
+            sc.load_universe()
+            orig = sc.daily_stats
+
+            def falling(sym, now):
+                out = dict(orig(sym, now))
+                if sym == "DOWN":
+                    out["closes"] = [1.6, 1.5, 1.4, 1.3, 1.2, 1.1, 1.0, 0.95, 0.9, 0.8]
+                return out
+            sc.daily_stats = falling
+            got = {(a.kind, a.symbol): a for a in sc.cycle()}
+            crash = got.get(("CRASH", "DOWN"))
+            self.assertIsNotNone(crash)
+            self.assertIn("Continuing downtrend", " ".join(crash.lines))
+            # the bankruptcy 8-K is real news: that black swan still fires
+            self.assertIn(("BLACKSWAN", "DOWN"), got)
+
+class TestUpsideOnly(unittest.TestCase):
+    """UPSIDE_ONLY (the live default): only PARABOLIC / BLACK SWAN moves UP, graded multibagger or
+    day trade, each with a buy zone, stop and targets. Nothing for falling stocks."""
+
+    def make(self, d, http=None):
+        sc, http, st = make_scanner(http, d)
+        sc.cfg.upside_only, sc.cfg.exit_alerts = True, False
+        sc.load_universe()
+        return sc, http, st
+
+    def test_only_upside_alerts_with_a_plan(self):
+        with tempfile.TemporaryDirectory() as d:
+            sc, http, st = self.make(d)
+            alerts = sc.cycle()
+            kinds = {(a.kind, a.symbol) for a in alerts}
+            self.assertTrue(kinds, "expected an upside alert")
+            for k, sym in kinds:
+                self.assertIn(k, ("PARABOLIC", "BLACKSWAN"), (k, sym))
+            self.assertNotIn("DOWN", {a.symbol for a in alerts})          # crash + bankruptcy: silent
+            self.assertNotIn("FLAT", {a.symbol for a in alerts})          # halt + offering news: silent
+            rokt = next(a for a in alerts if a.symbol == "ROKT")
+            text = " ".join(rokt.lines)
+            self.assertRegex(text, "Multibagger|Day trade")
+            self.assertIn("Buy zone", text)
+            self.assertIn("Stop", text)
+            self.assertIn("Target 1", text)
+            self.assertTrue(st.d["trades"]["ROKT"]["open"])               # tracked for STOP / TAKE PROFIT / SELL
+
+    def test_illiquid_non_runner_is_skipped(self):
+        with tempfile.TemporaryDirectory() as d:
+            sc, http, st = self.make(d)
+            sc.cfg.runner_score = 101                                    # nothing counts as a multibagger
+            sc.cfg.dt_min_dv15_regular = sc.cfg.dt_min_dv15_extended = 1e12   # and nothing is liquid enough
+            sc.cfg.max_spread = 0.001                                    # spread is the fallback check
+            self.assertEqual([a for a in sc.cycle() if a.kind in ("PARABOLIC", "BLACKSWAN")], [])
+
+    def test_up_black_swan(self):
+        with tempfile.TemporaryDirectory() as d:
+            sc, http, st = self.make(d)
+            orig = sc.daily_stats
+
+            def calm(sym, now):
+                out = dict(orig(sym, now))
+                out["sigma"] = 0.02                                      # a quiet stock: today's jump is extreme
+                return out
+            sc.daily_stats = calm
+            alerts = sc.cycle()
+            swan = [a for a in alerts if a.kind == "BLACKSWAN"]
+            self.assertTrue(swan)
+            self.assertTrue(all(a.symbol != "DOWN" for a in swan))
+            self.assertIn("Buy zone", " ".join(swan[0].lines))
+
