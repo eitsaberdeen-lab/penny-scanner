@@ -2,8 +2,8 @@
 """
 Penny Stock Scanner & Alerter — NASDAQ + NYSE, under $1 (or any band: MIN_PRICE / MAX_PRICE, e.g. $1–$20).
 
-UPSIDE_ONLY=on (default): only 🚀 PARABOLIC and 🦢 BLACK SWAN moves UP that are a possible
-multibagger or a liquid day-trade mover, each with buy zone / stop / targets and follow-up
+UPSIDE_ONLY=on (default): only 🚀 PARABOLIC and 🦢 BLACK SWAN moves UP that are a
+double-day candidate (100%+ day) or a liquid day-trade mover, each with buy zone / stop / targets and follow-up
 STOP / TAKE PROFIT / SELL alerts. UPSIDE_ONLY=off restores the full set below.
 
 Catches:
@@ -109,6 +109,14 @@ class Config:
         self.min_dv_extended = _envf("MIN_DOLLAR_VOL_15M_EXTENDED", 10_000)
         # black swan / crash
         self.sigma = _envf("BLACK_SWAN_SIGMA", 4.0)
+        # a true (Taleb) black swan is an outlier against the stock's OWN history: today's move must beat
+        # its biggest daily gain of the prior ~6 months, and (upside) come out of a rising 20-day trend
+        self.swan_record = _env("BLACK_SWAN_RECORD", "on").lower() != "off"
+        self.swan_min_trend = _envf("BLACK_SWAN_MIN_TREND", 0.0)
+        # early parabolic: the FIRST time a stock reaches +20% while at the day's high. On 60 days of real
+        # 5-minute bars this caught 277 of 284 +100% days; an "each leg steeper" curve rule only showed up
+        # in hindsight (caught 208, later, with more noise), so the 15-minute spike is no longer required
+        self.early_gain = _envf("PARABOLIC_EARLY_GAIN", 0.20)
         self.crash_day = _envf("CRASH_DAY_DROP", -0.35)
         # a price-only black swan must hit a stock that wasn't already falling: down this much
         # over the last ~10 sessions means today's drop is the trend continuing → CRASH instead
@@ -138,7 +146,7 @@ class Config:
         self.runner_alerts = _env("RUNNER_ALERTS", "on").lower() != "off"
         # exit alerts for stocks that were flagged PARABOLIC / BLACK SWAN
         # upside only (default): alert ONLY on 🚀 PARABOLIC and 🦢 BLACK SWAN moves UP, and only when the
-        # stock is a possible multibagger or a liquid day-trade mover. Every alert carries a buy zone,
+        # stock is a double-day candidate (100%+ day) or a liquid day-trade mover. Every alert carries a buy zone,
         # stop and targets, followed by STOP / TAKE PROFIT / SELL alerts. No crash / halt / news alerts.
         self.upside_only = _env("UPSIDE_ONLY", "on").lower() != "off"
         self.dt_min_dv15_regular = _envf("DAYTRADE_MIN_DOLLAR_VOL_15M_REGULAR", 100_000)
@@ -490,7 +498,7 @@ def parse_splits(res: dict | None) -> list[dict]:
 def fetch_daily_stats(http: Http, sym: str) -> dict | None:
     http.prime_yahoo()
     data = http.get_json(f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}",
-                         params={"interval": "1d", "range": "3mo", "includePrePost": "false", "events": "split"},
+                         params={"interval": "1d", "range": "6mo", "includePrePost": "false", "events": "split"},
                          headers=YAHOO_HEADERS, source="yahoo")
     if data is None:
         return None
@@ -499,14 +507,18 @@ def fetch_daily_stats(http: Http, sym: str) -> dict | None:
     s = parse_chart_result(res, sym)
     if not s or len(s.c) < 15:
         return {"sigma": None, "avgvol": None, "splits": splits}
-    closes = s.c[:-1]  # exclude today's (possibly partial) bar
+    today = datetime.now(NY).date()
+    closes = [c for t, c in zip(s.ts, s.c) if datetime.fromtimestamp(t, NY).date() < today]  # whole days only
     rets = [math.log(closes[i] / closes[i - 1]) for i in range(1, len(closes)) if closes[i - 1] > 0]
     rets = rets[-60:]
     vols = [v for v in s.v[:-1] if v][-60:]
     if len(rets) < 10:
         return {"sigma": None, "avgvol": None, "splits": splits}
+    day_gains = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes)) if closes[i - 1] > 0]
     return {"sigma": statistics.pstdev(rets) or 0.05, "avgvol": statistics.mean(vols) if vols else 0,
-            "closes": [round(x, 6) for x in closes[-10:]], "splits": splits}
+            "closes": [round(x, 6) for x in closes[-10:]], "splits": splits,
+            "maxg": max(day_gains[-125:]) if len(day_gains) >= 60 else None,
+            "tr20": closes[-1] / closes[-21] - 1 if len(closes) >= 21 and closes[-21] > 0 else None}
 
 
 def prior_trend(closes: list[float] | None) -> float | None:
@@ -611,6 +623,15 @@ class Analysis:
     n_bars: int
     day_vol: float = 0.0
     hod: float = 0.0
+    legs: tuple = ()          # the last three 5-minute moves, oldest first
+
+
+def accelerating(a: "Analysis", min_last: float = 0.02) -> bool:
+    """Parabolic in the textbook sense: each 5-minute leg up is steeper than the one before."""
+    if len(a.legs) != 3:
+        return False
+    r1, r2, r3 = a.legs
+    return r1 > 0 and r1 < r2 < r3 and r3 >= min_last
 
 
 def _price_at(ts, c, target, fallback):
@@ -668,6 +689,8 @@ def analyze(s: Series, fallback_prev: float | None) -> Analysis | None:
         return last / p - 1 if p else 0.0
 
     g5, g15, g30 = gain(5), gain(15), gain(30)
+    pts = [_price_at(ts, c, anchor - m * 60, None) for m in (15, 10, 5)] + [last]
+    legs = tuple(pts[i + 1] / pts[i] - 1 for i in range(3)) if all(pts) and ts[0] <= anchor - 15 * 60 else ()
 
     recent = _slope(ts, c, anchor - 10 * 60, anchor)
     prior = _slope(ts, c, anchor - 40 * 60, anchor - 10 * 60)
@@ -705,7 +728,7 @@ def analyze(s: Series, fallback_prev: float | None) -> Analysis | None:
         + 10 * hl_frac * (1.0 if vwap is None or last >= vwap else 0.5)
     )
     return Analysis(s.symbol, last, prev, last / prev - 1, g5, g15, g30, accel, rel_vol, dv15, vwap,
-                    hl_frac, score, anchor, len(c), float(sum(x or 0 for x in v)), max(t.h))
+                    hl_frac, score, anchor, len(c), float(sum(x or 0 for x in v)), max(t.h), legs)
 
 
 def runner_score(a: Analysis, u: dict, daily: dict | None, cats: list, session: str, now: float) -> tuple[float, list]:
@@ -1348,6 +1371,56 @@ def links_for(sym: str, exchange: str) -> list[tuple[str, str]]:
             ("Filings", f"https://www.sec.gov/edgar/search/#/q=&entityName={sym}")]
 
 
+# ─────────────────────────────── expected move left ─────────────────────
+# expected_moves.json is built by study_expected.py from real 5-minute bars: for stocks already up
+# +20/30/50/75/100/150/200% on the day (and within 10% of the high), how much further they really went.
+
+_EXPECTED: dict | None = None
+
+
+def load_expected(path: Path | None = None) -> dict:
+    global _EXPECTED
+    if _EXPECTED is None or path is not None:
+        p = path or Path(__file__).with_name("expected_moves.json")
+        try:
+            _EXPECTED = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            _EXPECTED = {}
+    return _EXPECTED
+
+
+def expected_stats(gain: float, prev: float | None, session: str, data: dict | None = None) -> tuple[float, dict] | None:
+    """Past outcomes for a stock already up `gain` on the day: (step, stats) from the most specific
+    group (price band + session) with enough cases, else a broader one. None below +20%."""
+    table = (data if data is not None else load_expected()).get("table") or {}
+    steps = sorted({float(k.rsplit("|", 1)[1]) for k in table})
+    step = max((x for x in steps if x <= gain + 1e-9), default=None)
+    if step is None:
+        return None
+    band = "under1" if prev is not None and prev < 1 else "1to20"
+    sess = "regular" if session == "regular" else "extended"
+    for b, ss in ((band, sess), (band, "all"), ("all", sess), ("all", "all")):
+        st = table.get(f"{b}|{ss}|{step:g}")
+        if st and st.get("n", 0) >= 30:
+            return step, st
+    return None
+
+
+def prob_reach(dec: list[float], x: float) -> float | None:
+    """Share of past moves whose further rise reached x, from the 10th…90th percentiles.
+    0.0 means beyond the 90th percentile (under 10%); None means no data."""
+    if len(dec) != 9:
+        return None
+    if x <= dec[0]:
+        return 0.9
+    for i in range(8):
+        lo, hi = dec[i], dec[i + 1]
+        if lo <= x <= hi:
+            f = (x - lo) / (hi - lo) if hi > lo else 0.0
+            return round(0.9 - 0.1 * (i + f), 3)
+    return 0.0
+
+
 # ─────────────────────────────── scanner ───────────────────────────────
 
 
@@ -1571,12 +1644,18 @@ class Scanner:
                          and above_vwap)
             big = a.day_gain >= self.cfg.min_day_gain or a.day_gain <= self.cfg.crash_day
             z = self.zscore(sym, a, now) if big else None
-            # upside black swan: a statistically extreme move UP (>= BLACK_SWAN_SIGMA vs 60-day volatility)
-            # that is holding; a gap-and-go doesn't need the 15-minute acceleration a parabolic needs
+            # upside black swan (Taleb: an outlier beyond the stock's regular range): >= BLACK_SWAN_SIGMA vs
+            # 60-day volatility AND bigger than any daily gain of the prior ~6 months, out of a rising
+            # 20-day trend (not a bounce in a collapse), holding above VWAP near the high
             up_swan = (self.cfg.upside_only and z is not None and z >= self.cfg.sigma
                        and self.cfg.in_range(a.prev_close) and a.day_gain >= self.cfg.min_day_gain
-                       and a.dv15 >= mindv and above_vwap)
-            # a multibagger candidate climbing steadily (no 15-minute spike) still counts as parabolic
+                       and a.dv15 >= mindv and above_vwap and self.swan_context(sym, a, now)[0])
+            # parabolic, early: first time at +20% while at the day's high (no 15-minute spike needed)
+            early = (self.cfg.upside_only and not parabolic and self.cfg.in_range(a.prev_close)
+                     and a.day_gain >= self.cfg.early_gain and a.dv15 >= mindv and above_vwap
+                     and (not a.hod or a.last >= a.hod * 0.97))
+            parabolic = parabolic or early
+            # a double-day candidate climbing steadily (no 15-minute spike) still counts as parabolic
             if (self.cfg.upside_only and not parabolic and a.day_gain >= 0.20 and above_vwap
                     and a.dv15 >= mindv and self.cfg.in_range(a.prev_close)
                     and self.runner.get(sym, (0.0, []))[0] >= self.cfg.runner_score):
@@ -1592,10 +1671,11 @@ class Scanner:
                 kind = "BLACKSWAN" if up_swan else "PARABOLIC"
                 grade = self.upside_grade(sym, a, ext, sym in vol_known) if self.cfg.upside_only else None
                 if self.cfg.upside_only and not grade:
-                    log.info("%s %s skipped: neither multibagger potential nor a liquid day-trade mover", sym, kind)
+                    log.info("%s %s skipped: neither a double-day candidate nor a liquid day-trade mover", sym, kind)
                     continue
                 if self.state.should_alert(kind, sym, a.last, now, self.cfg.cooldown_min, self.cfg.realert_gain):
-                    alerts.append(self.parabolic_alert(sym, a, z, session, now, kind=kind, grade=grade, s=s))
+                    alerts.append(self.parabolic_alert(sym, a, z, session, now, kind=kind, grade=grade, s=s,
+                                                       early=early and not up_swan))
             elif crash:
                 trend = prior_trend(self.daily_stats(sym, now).get("closes"))
                 falling = trend is not None and trend <= -self.cfg.swan_prior_drop
@@ -1678,7 +1758,7 @@ class Scanner:
         if a.kind in ("PARABOLIC", "BLACKSWAN"):
             tr = self.state.d.get("trades", {}).get(a.symbol) or {}
             grade = next((ln.split(":", 1)[0].split(" ", 1)[-1] for ln in a.lines
-                          if ln.startswith(("🔥 Multibagger", "⚡ Day trade"))), "")
+                          if ln.startswith(("🔥 Double-day candidate", "⚡ Day trade"))), "")
             q = self.last_quick.get(a.symbol)
             prev = q[0] / (1 + q[1]) if q and q[1] > -1 else self.universe.get(a.symbol, {}).get("prev")
             book["alerts"].append({"sym": a.symbol, "kind": a.kind, "t": now, "price": a.price, "grade": grade,
@@ -1872,7 +1952,7 @@ class Scanner:
     def daily_stats(self, sym: str, now: float) -> dict:
         today = datetime.fromtimestamp(now, NY).date().isoformat()
         st = self.state.d["daily"].get(sym)
-        if not st or st.get("d") != today or "splits" not in st:
+        if not st or st.get("d") != today or "maxg" not in st:
             stats = fetch_daily_stats(self.http, sym)
             st = {"d": today, **(stats or {"sigma": None, "avgvol": None, "splits": []})}
             self.state.d["daily"][sym] = st
@@ -1899,6 +1979,7 @@ class Scanner:
                  f"Price {fp(a.last)} ({pct(a.day_gain)} today · {pct(a.g15)} in 15m) · VWAP {fp(a.vwap)}",
                  f"Runner score {sc:.0f}/100: " + (", ".join(why) if why else "momentum + volume")]
         lines += self.runner_buy_plan(sym, s, a, now)
+        lines += self.expected_lines(sym, a, session)
         if session != "regular":
             lines.append("Extended hours: thin liquidity, use limit orders only")
         lines.append(clock_line(now))
@@ -1933,6 +2014,43 @@ class Scanner:
                    + " · I'll send STOP / TAKE PROFIT / SELL alerts for this")
         return out
 
+    def expected_lines(self, sym: str, a: Analysis, session: str) -> list[str]:
+        """How much further stocks already this far up really went (real past data), checked against
+        the stop / Target 1, so a late entry near the peak is flagged."""
+        got = expected_stats(a.day_gain, a.prev_close, session)
+        if not got:
+            return []
+        step, st = got
+        lines = [f"📊 Expected left (up {pct(a.day_gain)} now; {st['n']} past moves from +{step * 100:.0f}%): "
+                 f"typical {pct(st['med'])} more, best quarter {pct(st['p75'])}+ · {st['hit20'] * 100:.0f}% went "
+                 f"another +20% · {st['below'] * 100:.0f}% closed the day below the alert price"]
+        tr = self.state.d.get("trades", {}).get(sym) or {}
+        entry, stop, t1 = tr.get("entry"), tr.get("stop"), tr.get("t1")
+        risk = (1 - stop / entry) if tr.get("open") and entry and stop and entry > stop else None
+        if tr.get("open") and t1 and a.last > 0 and t1 > a.last:
+            need = t1 / a.last - 1
+            p = prob_reach(st.get("dec") or [], need)
+            if p is not None:
+                lines.append(f"Target 1 ({pct(need)} from here) was reached by "
+                             + (f"~{p * 100:.0f}%" if p > 0 else "under 10%") + " of them")
+        if risk is not None and st["med"] < risk:
+            lines.append(f"⚠️ Late entry: the typical move left ({pct(st['med'])}) is smaller than the stop "
+                         f"({pct(-risk)}). Likely near the peak: wait for a pullback or skip")
+        elif st["med"] < 0.10:
+            lines.append(f"⚠️ Late entry: typically only {pct(st['med'])} left from here. Likely near the peak")
+        return lines
+
+    def swan_context(self, sym: str, a: Analysis, now: float) -> tuple[bool, str]:
+        """(is it a true upside black swan, why): a record move for this stock out of a rising trend."""
+        st = self.daily_stats(sym, now)
+        maxg, tr20 = st.get("maxg"), st.get("tr20")
+        if self.cfg.swan_record and (maxg is None or a.day_gain <= maxg):
+            return False, ""
+        if tr20 is None or tr20 < self.cfg.swan_min_trend:
+            return False, ""
+        return True, (f"Record move: {pct(a.day_gain)} beats its biggest day of the last 6 months ({pct(maxg)})"
+                      if maxg is not None else "") + f" · 20-day trend {pct(tr20)}"
+
     def zscore(self, sym: str, a: Analysis, now: float) -> float | None:
         st = self.daily_stats(sym, now)
         if not st.get("sigma") or a.last <= 0 or a.prev_close <= 0:
@@ -1940,12 +2058,13 @@ class Scanner:
         return math.log(a.last / a.prev_close) / st["sigma"]
 
     def upside_grade(self, sym: str, a: Analysis, ext: bool, vol_known: bool) -> tuple[str, str] | None:
-        """Is this up-move worth an alert? ("Multibagger", why) when the 100%+ runner score is high,
+        """Is this up-move worth an alert? ("Double-day candidate", why) when the 100%+ day score is high
+        (not a multibagger: that is 2x+ from the buy price, usually over months),
         ("Day trade", why) when it is liquid and in play (dollar volume, relative volume, tight
         spread, holding above VWAP), else None."""
         sc, why = self.runner.get(sym, (0.0, []))
         if sc >= self.cfg.runner_score:
-            return "Multibagger", f"100%+ runner potential {sc:.0f}/100" + (f" - {', '.join(why[:4])}" if why else "")
+            return "Double-day candidate", f"100%+ day potential {sc:.0f}/100" + (f" - {', '.join(why[:4])}" if why else "")
         min_dv = self.cfg.dt_min_dv15_extended if ext else self.cfg.dt_min_dv15_regular
         if vol_known and a.dv15 < min_dv:
             return None
@@ -1975,7 +2094,7 @@ class Scanner:
 
     def parabolic_alert(self, sym: str, a: Analysis, z: float | None, session: str, now: float,
                         kind: str = "PARABOLIC", grade: tuple[str, str] | None = None,
-                        s: Series | None = None) -> Alert:
+                        s: Series | None = None, early: bool = False) -> Alert:
         u = self.universe.get(sym, {})
         cat = self.state.best_catalyst(sym)
         if not cat:
@@ -1985,10 +2104,17 @@ class Scanner:
                  f"Price {fp(a.last)}  ({pct(a.day_gain)} today · {pct(a.g15)} in 15m · {pct(a.g5)} in 5m)",
                  f"Prev close {fp(a.prev_close)} · VWAP {fp(a.vwap)} · score {a.score:.0f}/100",
                  f"15m $ volume {human(a.dv15)} · rel vol {('%.1fx' % a.rel_vol) if a.rel_vol else 'n/a'} · accel {a.accel:.1f}x"]
-        if z is not None and abs(z) >= self.cfg.sigma:
-            lines.append(f"🦢 {z:+.1f}σ move vs its 60-day volatility")
+        if kind == "BLACKSWAN":
+            why = self.swan_context(sym, a, now)[1]
+            lines.append(f"🦢 {z:+.1f}σ vs its 60-day volatility" + (f" · {why.lstrip(' ·')}" if why else ""))
+        elif z is not None and abs(z) >= self.cfg.sigma:
+            lines.append(f"{z:+.1f}σ move vs its 60-day volatility")
+        if early:
+            lines.append(f"📈 Early: at {pct(a.day_gain)} and at the day's high"
+                         + (" · accelerating, 5-min legs " + " → ".join(pct(x) for x in a.legs)
+                            if accelerating(a) else ""))
         if grade:
-            lines.insert(1, f"{'🔥' if grade[0] == 'Multibagger' else '⚡'} {grade[0]}: {grade[1]}")
+            lines.insert(1, f"{'🔥' if grade[0] == 'Double-day candidate' else '⚡'} {grade[0]}: {grade[1]}")
         else:
             rl = self.runner_line(sym)
             if rl:
@@ -1997,6 +2123,7 @@ class Scanner:
             if a.vwap and a.last >= a.vwap * 1.3:
                 lines.append(f"Extended {pct(a.last / a.vwap - 1)} above VWAP: small size; a dip toward VWAP is a safer entry")
             lines += self.upside_plan_lines(sym, s, a, now)
+            lines += self.expected_lines(sym, a, session)
             if session != "regular":
                 lines.append("Extended hours: thin liquidity, use limit orders only")
         elif self.cfg.trade_signals and a.vwap and a.last >= a.vwap * 1.3:

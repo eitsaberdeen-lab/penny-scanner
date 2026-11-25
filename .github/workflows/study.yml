@@ -1,0 +1,30 @@
+name: Refresh expected-move table
+
+# Every Saturday: re-measure how far stocks that were already up +20%…+200% really went next,
+# from the last 60 days of real 5-minute bars, and commit expected_moves.json for the scanners.
+on:
+  schedule:
+    - cron: "17 6 * * 6"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  study:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python study_expected.py
+      - name: Commit the new table
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add expected_moves.json
+          git diff --cached --quiet || git commit -m "Refresh expected-move table" && git push

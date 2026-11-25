@@ -859,7 +859,7 @@ class TestUpsideOnly(unittest.TestCase):
             self.assertNotIn("FLAT", {a.symbol for a in alerts})          # halt + offering news: silent
             rokt = next(a for a in alerts if a.symbol == "ROKT")
             text = " ".join(rokt.lines)
-            self.assertRegex(text, "Multibagger|Day trade")
+            self.assertRegex(text, "Double-day candidate|Day trade")
             self.assertIn("Buy zone", text)
             self.assertIn("Stop", text)
             self.assertIn("Target 1", text)
@@ -888,6 +888,35 @@ class TestUpsideOnly(unittest.TestCase):
             self.assertTrue(swan)
             self.assertTrue(all(a.symbol != "DOWN" for a in swan))
             self.assertIn("Buy zone", " ".join(swan[0].lines))
+            self.assertIn("Record move", " ".join(swan[0].lines))
+
+    def _swan_with(self, **over):
+        with tempfile.TemporaryDirectory() as d:
+            sc, http, st = self.make(d)
+            orig = sc.daily_stats
+
+            def stats(sym, now):
+                out = dict(orig(sym, now))
+                out["sigma"] = 0.02
+                out.update(over)
+                return out
+            sc.daily_stats = stats
+            return [a for a in sc.cycle() if a.kind == "BLACKSWAN"]
+
+    def test_swan_needs_rising_trend(self):
+        self.assertEqual(self._swan_with(tr20=-0.40), [])            # a bounce inside a collapse is not a swan
+
+    def test_swan_needs_record_move(self):
+        self.assertEqual(self._swan_with(maxg=5.0), [])              # it has done bigger days before: not an outlier
+
+    def test_accelerating_legs(self):
+        a = S.Analysis.__new__(S.Analysis)
+        a.legs = (0.01, 0.02, 0.04)
+        self.assertTrue(S.accelerating(a))
+        a.legs = (0.03, 0.02, 0.04)                                  # not each steeper
+        self.assertFalse(S.accelerating(a))
+        a.legs = (0.002, 0.005, 0.01)                                # rising but the last leg is too small
+        self.assertFalse(S.accelerating(a))
 
 class TestNearHighAndScorecard(unittest.TestCase):
     def make(self, d):
@@ -937,3 +966,42 @@ class TestNearHighAndScorecard(unittest.TestCase):
             book["sent"] = True
             self.assertEqual(sc.scorecard_due("afterhours", late), [])
 
+class TestExpectedLeft(unittest.TestCase):
+    """The "expected left" line: how much further stocks already this far up really went."""
+    DATA = {"table": {
+        "under1|regular|0.2": {"n": 50, "med": 0.06, "p25": 0.02, "p75": 0.17, "hit10": 0.3, "hit20": 0.2,
+                               "hit50": 0.05, "below": 0.7,
+                               "dec": [0.0, 0.01, 0.02, 0.04, 0.06, 0.09, 0.14, 0.2, 0.33]},
+        "all|all|0.5": {"n": 40, "med": 0.15, "p25": 0.05, "p75": 0.35, "hit10": 0.6, "hit20": 0.4,
+                        "hit50": 0.18, "below": 0.76, "dec": [0.01, 0.03, 0.06, 0.1, 0.15, 0.2, 0.28, 0.4, 0.6]},
+        "1to20|regular|0.5": {"n": 12, "med": 0.9}}}
+
+    def test_bucket_and_fallback(self):
+        self.assertIsNone(S.expected_stats(0.15, 0.5, "regular", self.DATA))          # under +20%: no line
+        step, st = S.expected_stats(0.35, 0.5, "regular", self.DATA)
+        self.assertEqual((step, st["med"]), (0.2, 0.06))                             # +35% → the +20% step
+        step, st = S.expected_stats(0.6, 5.0, "regular", self.DATA)
+        self.assertEqual((step, st["med"]), (0.5, 0.15))                             # too few cases → broader group
+
+    def test_prob_reach(self):
+        dec = self.DATA["table"]["all|all|0.5"]["dec"]
+        self.assertAlmostEqual(S.prob_reach(dec, 0.15), 0.5)
+        self.assertEqual(S.prob_reach(dec, 0.0), 0.9)
+        self.assertEqual(S.prob_reach(dec, 0.9), 0.0)                                # beyond the 90th percentile
+        self.assertIsNone(S.prob_reach([], 0.1))                                     # no spread data: no line
+
+    def test_alert_flags_late_entry(self):
+        with tempfile.TemporaryDirectory() as d:
+            sc, http, st = make_scanner(None, d)
+            S._EXPECTED = self.DATA
+            try:
+                st.d.setdefault("trades", {})["XX"] = {"open": True, "entry": 0.60, "stop": 0.51, "t1": 0.78}
+                a = S.Analysis.__new__(S.Analysis)
+                a.day_gain, a.prev_close, a.last = 0.25, 0.48, 0.60
+                text = " | ".join(sc.expected_lines("XX", a, "regular"))
+            finally:
+                S._EXPECTED = None
+            self.assertIn("Expected left", text)
+            self.assertIn("typical +6", text)
+            self.assertIn("Target 1 (+30", text)
+            self.assertIn("Late entry", text)                                       # +6% left < 15% stop
