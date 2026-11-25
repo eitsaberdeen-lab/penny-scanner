@@ -29,7 +29,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 100
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN || secrets.BSWANPARA_BOT }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -88,7 +88,7 @@ jobs:
 
       - name: Scan
         run: |
-          ARGS="--duration 560"
+          ARGS="--duration 5400"
           if [ "${{ inputs.test_alert }}" = "true" ]; then
             ARGS="--test-alert"
           elif [ -n "${{ inputs.force_session }}" ] && [ "${{ inputs.force_session }}" != "auto" ]; then
