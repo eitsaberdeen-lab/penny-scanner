@@ -844,8 +844,13 @@ def find_buy_setup(s: Series, a: Analysis, cfg: Config) -> Setup | None:
     if n >= 21 and C[-2] < a.vwap < last:
         prior = C[-11:-1]
         below = sum(1 for c in prior if c < a.vwap)
-        base_vol = statistics.median(V[-21:-1]) or 1.0
-        if below >= 5 and cur_vol >= 1.5 * base_vol and last / a.prev_close - 1 >= cfg.min_day_gain:
+        # Normal volume = median of the minutes that actually traded. Thin stocks have many zero-volume
+        # minutes: a plain median was then 0 and fell back to 1 share, so any trade looked like "95002x"
+        # and the volume check passed on almost nothing. Too few traded minutes = no volume confirmation.
+        traded = [v for v in V[-21:-1] if v > 0]
+        base_vol = statistics.median(traded) if len(traded) >= 10 else None
+        if (base_vol and below >= 5 and cur_vol >= 1.5 * base_vol
+                and last / a.prev_close - 1 >= cfg.min_day_gain):
             dip_low = min(L[-11:-1])
             st = build("VWAP reclaim", last, dip_low * 0.99,
                        f"Reclaimed VWAP {fp(a.vwap)} on {cur_vol / base_vol:.1f}x volume after a {below}-minute dip")

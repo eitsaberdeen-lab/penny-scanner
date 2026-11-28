@@ -447,6 +447,30 @@ class TestTradeSignals(unittest.TestCase):
         s = series_from(parabolic_bars(), sym="ROKT")
         self.assertIsNone(S.find_buy_setup(s, S.analyze(s, 0.40), self.cfg))
 
+    def _reclaim_bars(self, quiet):
+        """Run-up to 0.70, a 12-minute dip under VWAP, then a reclaim bar. quiet=True: most minutes trade nothing."""
+        t, prev, bars = S.datetime(2026, 11, 9, 9, 0, tzinfo=S.NY).timestamp(), 0.40, []
+        path = [0.40 + 0.3 * i / 14 for i in range(15)] + [0.66, 0.62, 0.60, 0.58] + [0.52] * 12 + [0.64]
+        for i, p in enumerate(path):
+            if i < 15: v = 80_000
+            elif i == len(path) - 1: v = 95_000
+            else: v = (0 if i % 4 else 900) if quiet else 20_000
+            bars.append((int(t), prev, max(prev, p) * 1.002, min(prev, p) * 0.998, p, v)); prev = p; t += 60
+        return bars
+
+    def test_vwap_reclaim_volume_ratio_is_real(self):
+        s = series_from(self._reclaim_bars(quiet=False))
+        st = S.find_buy_setup(s, S.analyze(s, 0.40), self.cfg)
+        self.assertIsNotNone(st); self.assertEqual(st.name, "VWAP reclaim")
+        ratio = float(S.re.search(r"on ([0-9.]+)x volume", st.note).group(1))
+        self.assertTrue(1.5 <= ratio < 10, st.note)
+
+    def test_vwap_reclaim_needs_real_volume_on_thin_stocks(self):
+        # most of the last 20 minutes traded nothing: no "95002x volume", no volume-confirmed reclaim
+        s = series_from(self._reclaim_bars(quiet=True))
+        st = S.find_buy_setup(s, S.analyze(s, 0.40), self.cfg)
+        self.assertTrue(st is None or st.name != "VWAP reclaim", st and st.note)
+
     def _exit(self, tr, price, now_off=600):
         base = flag_bars()
         t_last = base[-1][0]
